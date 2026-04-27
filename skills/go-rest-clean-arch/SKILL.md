@@ -36,9 +36,15 @@ If the project is a generic Go module without these markers, **do not apply this
    - **Response envelope** → `app/controller/common/response.go` (`SendSuccess`, `SendError`). Do not hand-roll `c.JSON(...)` shapes per controller.
    - **Timezone helpers** → `app/use_case/common/timezone.go` (`ReinterpretDateInTZ`, `LoadLocationOrDefault`, `StartOfDayInTZ`, `EndOfDayInTZ`).
    When the user asks to "add pagination / filtering / error handling / timestamps to feature X", first **grep for existing helpers** in `pkg/` and `app/*/common/`, reuse them, and only add to the shared util if a genuinely new pattern is needed (and then move it to `common/` so the next feature inherits it).
-7. **Swagger annotations only on HTTP handler functions** in controllers — never on use_case, repository, or private helpers.
-8. **APM and structured logging** come last; require Phase 1–2 to be 99% complete (per `instruction_order.md`).
-9. **Defaults you can write without comments** still apply per the user's general code style; comments are allowed in this playbook only when they capture non-obvious WHY (constraints, invariants, surprising behaviour).
+7. **No N+1 queries from the use_case layer.** When iterating a slice of entities, never call `repo.GetOne(...)`, `repo.List(filter for a single ID)` or any other per-item query inside the loop. Three accepted shapes instead:
+   - **Batch fetch then assemble in memory** — collect IDs first, call `repo.List(filter{Ids: ids})` (or a dedicated `GetByIDs`) once, build a `map[ID]Entity`, then enrich the slice.
+   - **Eager-load at the repo layer** — push the relation into the repo via GORM `Preload(...)` / `Joins(...)` so the controller/use_case never has to fetch it again.
+   - **Dedicated batch / aggregate method** — when the join is non-trivial, add a new method to the repo (`ListWithRelations`, `GetSummariesByDates`) and use that. Do **not** paper over the problem with a goroutine fan-out.
+
+   Before declaring a use_case method done: mentally run it on a list of N=1000. If it fires N+1 queries, refactor or add the missing batch method to the repo. This applies to every loop that touches `r.<repo>.` inside `app/use_case/`.
+8. **Swagger annotations only on HTTP handler functions** in controllers — never on use_case, repository, or private helpers.
+9. **APM and structured logging** come last; require Phase 1–2 to be 99% complete (per `instruction_order.md`).
+10. **Defaults you can write without comments** still apply per the user's general code style; comments are allowed in this playbook only when they capture non-obvious WHY (constraints, invariants, surprising behaviour).
 
 ## Mandatory reading order
 
