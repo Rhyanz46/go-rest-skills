@@ -95,6 +95,39 @@ type TrackHTTPResponse struct {
 
 The fields might be identical today. They will diverge in 6 months. Keep them separate from day one.
 
+### B.1 — Subtle variant: importing `database/schemas` from a use_case
+
+```go
+// app/use_case/friend_use_case/usecase.go
+import "planner-backend/database/schemas"   // ← violates rule #4
+
+func (r *friendUseCase) Accept(...) {
+    var f schemas.Friendship                 // GORM model in domain logic
+    // ...
+}
+```
+
+The schema package *is* the GORM model layer. Importing it into a use_case is the same crime as putting `gorm:` tags on a use_case struct — you've coupled domain logic to the persistence schema. Any future schema rename or split forces the use_case to change.
+
+### ✅ Benar — repo returns its own domain type, use_case never sees `schemas`
+
+```go
+// app/repository/friends_repository/models.go
+type Friendship struct {                     // domain-level, no GORM tags
+    ID          uint
+    RequesterID uuid.UUID
+    AccepterID  uuid.UUID
+    Status      string
+}
+// schema → domain transform stays inside the repository package.
+
+// app/use_case/friend_use_case/usecase.go
+import "planner-backend/app/repository/friends_repository"   // OK
+// no schemas import anywhere
+```
+
+Grep that should be empty in a clean repo: `rg 'database/schemas' app/use_case/`.
+
 ---
 
 ## C. Auth context leak (rule #7)
@@ -217,6 +250,37 @@ for _, id := range ids {
 
 Same N queries, just concurrent. DB connection pool fills up, "improves" latency for one user but tanks throughput. Forbidden.
 
+### E.1 — Subtle variant: per-item validation loop
+
+```go
+// app/use_case/sharing_use_case/validation.go
+func (r *sharingUseCase) validateTagOwnership(ctx context.Context, userID uuid.UUID, tagIDs []uint) error {
+    for _, tagID := range tagIDs {
+        _, status, err := r.trackRepo.GetOneTag(ctx, TagFilter{Id: &tagID})  // ← per-tag query
+        if err != nil { /* ... */ }
+        // also check ownership per tag
+    }
+    return nil
+}
+```
+
+This isn't enrichment — it's *validation* — but it's still N+1. A user creating a share with 20 tags fires 20 queries for a single ownership check.
+
+### ✅ Benar — single batch query, validate against the result set
+
+```go
+func (r *sharingUseCase) validateTagOwnership(ctx context.Context, userID uuid.UUID, tagIDs []uint) error {
+    tags, _, _, err := r.trackRepo.ListTags(ctx, TagFilter{Ids: tagIDs, OwnerUserID: &userID}, nil)
+    if err != nil { return common.RepositoryErrorToDomain(...) }
+    if len(tags) != len(tagIDs) {
+        return errors.New("one or more tags not found or not owned by user")
+    }
+    return nil
+}
+```
+
+One query, both existence and ownership verified. Same shape applies to "all tracks belong to user", "all friend IDs are accepted", etc.
+
 ---
 
 ## F. Reusing pagination per feature (rule #10)
@@ -303,6 +367,26 @@ func (r *templatePlanUseCase) deleteAllTracksByDateAndUser(...) error {
 
 A `return nil` lies to the caller. Either the function works, or it returns an error that says it doesn't.
 
+### G.1 — Subtle variant: a function whose body is *one branch* of real work, gated by a `// TODO`
+
+```go
+func (r *templatePlanUseCase) ensureSingleInProgressTrack(ctx context.Context, userID uuid.UUID, created []interface{}) error {
+    hasInProgress := false
+    for _, t := range created { /* ... detect ... */ }
+
+    if hasInProgress {
+        // This would complete all other "in progress" tracks for this user.
+        // Implementation would go here in production.
+        // For now, just return nil.
+    }
+    return nil
+}
+```
+
+This is worse than the obvious placeholder — there *is* logic (the detection loop), but the actual side-effect is gated behind a `// TODO`. The function reads like it's working. Callers see no error, code reviewers skim past the comment.
+
+Treat it the same way: either implement the side-effect, return an explicit error, or delete the function. Don't ship "half a function".
+
 ---
 
 ## H. Timezone — server-local "today" (rule #13 + timezone helpers from rule #10)
@@ -330,6 +414,27 @@ anchored := common.ReinterpretDateInTZ(*req.Date, loc)
 ```
 
 For output, **don't** convert — keep `time.Time` UTC and let frontend localize (rule #13).
+
+### H.1 — Subtle variant: direct `time.LoadLocation` calls scattered across the use_case
+
+```go
+// app/use_case/track_use_case/usecase.go (×6 callsites)
+loc, err := time.LoadLocation(userTimezone)
+if err != nil {
+    loc, _ = time.LoadLocation("Asia/Jakarta")   // fallback duplicated everywhere
+}
+```
+
+The fallback is fine in isolation. Repeated 11 times across 2 files, it becomes a maintenance liability — change the default TZ once and you must hunt every callsite. Plus most callsites silently `_` the error (a smell of its own).
+
+### ✅ Benar — funnel through one helper
+
+```go
+loc, tz := common.LoadLocationOrDefault(userTimezone)
+// loc is never nil; tz tells you whether the input was honoured or fell back
+```
+
+Rule of thumb: in `app/use_case/**`, the only acceptable callsite of `time.LoadLocation` is **inside** `app/use_case/common/timezone.go`. Anywhere else, use the helper. Same logic applies to other "load this thing or fall back" primitives — wrap once, reuse.
 
 ---
 
@@ -364,10 +469,14 @@ Then either: refactor all in one PR, or open one ticket that lists all spots and
 |---|---|---|
 | `GetByX`, `FindByY` repo methods | Filter Pattern (#8) | Section A |
 | GORM tags in JSON response | Three-model rule (#6) | Section B |
+| `import "...database/schemas"` in `app/use_case/` | Layer dependency (#4) | Section B.1 |
 | `*gin.Context` below controller | Auth leak (#7) | Section C |
 | `(result, error)` from repo | Error trio (#5) | Section D |
 | Loop with `repo.GetOne` inside | N+1 (#11) | Section E |
+| Loop with `repo.<Validate/Check>One` inside | N+1 (#11) | Section E.1 |
 | `page`/`page_size` parsing in controller | Reuse pkg/ (#10) | Section F |
 | `// TODO implement, return nil` | Placeholder ban (#12) | Section G |
+| Function with detection logic + `// TODO` gating side-effect | Placeholder ban (#12) | Section G.1 |
 | `time.Now().Location()` for "today" | Timezone (#13 + helpers) | Section H |
+| `time.LoadLocation(...)` outside `app/use_case/common/` | Reuse pkg/ (#10) | Section H.1 |
 | Many small bugs with same root cause | Audit-before-fix (#3) | Section I |
