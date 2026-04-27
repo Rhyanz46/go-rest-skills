@@ -30,9 +30,15 @@ If the project is a generic Go module without these markers, **do not apply this
 3. **Layer dependency direction is one-way.** Controller depends on use_case, use_case depends on repository. Never the other direction. No business logic in controllers, no HTTP types in use_case, no GORM types leaking out of repository.
 4. **Filter Pattern is mandatory** for every list/query operation in repositories — see `references/app_package.md`.
 5. **Validation lives in `rules.go` as package-level `var`** declared via `map_validator.BuildRoles()`, called from controllers with `map_validator.ValidateJSON[T]`. Do **not** use `c.ShouldBindJSON` or `binding:"..."` tags for validation in this style.
-6. **Swagger annotations only on HTTP handler functions** in controllers — never on use_case, repository, or private helpers.
-7. **APM and structured logging** come last; require Phase 1–2 to be 99% complete (per `instruction_order.md`).
-8. **Defaults you can write without comments** still apply per the user's general code style; comments are allowed in this playbook only when they capture non-obvious WHY (constraints, invariants, surprising behaviour).
+6. **Reuse shared utilities — never duplicate logic per feature.** Cross-cutting concerns must come from the shared `pkg/` layer, not be re-implemented inside a feature folder. The canonical reusables:
+   - **Pagination** → `pkg/paginate_utils/` (`PaginateData`, `Paginate(p)` GORM scope, `NewPagination(paginate, total)` response envelope). Every list endpoint accepts `*paginate_utils.PaginateData` in the use_case signature, the repo applies it via `db.Scopes(paginate_utils.Paginate(p))`, and the response wraps the slice with `paginate_utils.NewPagination(...)`. Never write per-feature `page`/`page_size` parsing, offset math, or response-shape code.
+   - **Error mapping** → `app/use_case/common/error_mapper.go` and `app/repository/common/`. Use them; do not invent new repo-error → HTTP-status conversions per feature.
+   - **Response envelope** → `app/controller/common/response.go` (`SendSuccess`, `SendError`). Do not hand-roll `c.JSON(...)` shapes per controller.
+   - **Timezone helpers** → `app/use_case/common/timezone.go` (`ReinterpretDateInTZ`, `LoadLocationOrDefault`, `StartOfDayInTZ`, `EndOfDayInTZ`).
+   When the user asks to "add pagination / filtering / error handling / timestamps to feature X", first **grep for existing helpers** in `pkg/` and `app/*/common/`, reuse them, and only add to the shared util if a genuinely new pattern is needed (and then move it to `common/` so the next feature inherits it).
+7. **Swagger annotations only on HTTP handler functions** in controllers — never on use_case, repository, or private helpers.
+8. **APM and structured logging** come last; require Phase 1–2 to be 99% complete (per `instruction_order.md`).
+9. **Defaults you can write without comments** still apply per the user's general code style; comments are allowed in this playbook only when they capture non-obvious WHY (constraints, invariants, surprising behaviour).
 
 ## Mandatory reading order
 
