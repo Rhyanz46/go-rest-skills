@@ -85,6 +85,7 @@ Read references in this exact sequence. Each line is a checkpoint — confirm un
 | 3.1 (optional) | `references/swagger_annotation_guide.md` | Only after controllers + routes are working end-to-end. Annotate **HTTP handler functions only** — never use_case, repository, or private helpers. |
 | 3.2 (optional) | `references/apm_and_log_guide.md` | Only when Phase 1–2 are 99% complete and all business features are working. |
 | Sidebar | `references/anti-patterns.md` | Whenever you're about to write or review a loop with a repo call, a transform between layers, a filter struct, a placeholder function, or a timezone-dependent calculation. Concrete "salah vs benar" examples for every hard rule. |
+| Recipe | `references/feature-recipe.md` | Whenever you're adding a new feature end-to-end. Concrete walkthrough: file layout per layer, schema + AutoMigrate, central wiring (`repositories.go` / `use_cases.go` / `controllers.go`), routes setup, ownership filter from controller, computed filter translation in use_case, datetime validation note. Use the `reminders` example as template. |
 
 If a user request requires content from a phase the project hasn't reached yet, refuse and explain — do not jump phases.
 
