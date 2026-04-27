@@ -494,6 +494,97 @@ Then either: refactor all in one PR, or open one ticket that lists all spots and
 
 ---
 
+## J. REST surface naming — two buckets, no exceptions (rule #17)
+
+### ❌ Salah — camelCase JSON keys
+
+```go
+// app/controller/track_controller/models.go
+type TrackResponse struct {
+    ID        uint      `json:"id"`
+    UserID    uuid.UUID `json:"userId"`        // ← camelCase
+    CreatedAt time.Time `json:"createdAt"`     // ← camelCase
+    DueAt     time.Time `json:"dueAt"`         // ← camelCase
+}
+```
+
+Frontend has to write `response.userId ?? response.user_id` shims because half the backend uses snake, half uses camel. Forever.
+
+### ✅ Benar — snake_case JSON keys
+
+```go
+type TrackResponse struct {
+    ID        uint      `json:"id"`
+    UserID    uuid.UUID `json:"user_id"`
+    CreatedAt time.Time `json:"created_at"`
+    DueAt     time.Time `json:"due_at"`
+}
+```
+
+### ❌ Salah — snake_case in query / path params
+
+```go
+// request struct
+type GetTracksRequest struct {
+    DateFrom *time.Time `form:"date_from"`     // ← snake in URL
+    PageSize int        `form:"page_size"`     // ← snake in URL
+}
+
+// routes
+r.GET("/api/shared/:user_id/tracks", c.GetSharedTracks)   // ← snake path param
+r.GET("/api/template_plan/:id", c.GetTemplate)            // ← snake path segment
+```
+
+Client URL becomes `/api/shared/abc123/tracks?date_from=2026-04-25&page_size=20`. Underscore inside URL paths is technically valid but uncommon, conflicts with auto-link parsers, and mixes two casings on the same surface (path is `/template_plan` snake, but `/api` is just a word — looks wrong).
+
+### ✅ Benar — kebab-case for everything in the URL
+
+```go
+type GetTracksRequest struct {
+    DateFrom *time.Time `form:"date-from"`
+    PageSize int        `form:"page-size"`
+}
+
+r.GET("/api/shared/:user-id/tracks", c.GetSharedTracks)
+r.GET("/api/template-plan/:id", c.GetTemplate)
+
+// inside the controller:
+userID := c.Param("user-id")   // matches the route declaration
+```
+
+Client URL becomes `/api/shared/abc123/tracks?date-from=2026-04-25&page-size=20`. Reads as one consistent dialect.
+
+### ❌ Salah — camelCase URL paths
+
+```go
+r.GET("/api/templatePlan/:id", c.GetTemplate)
+r.POST("/api/personaProfile/answers", c.SubmitAnswers)
+```
+
+Some clients lowercase URLs; some don't. Inconsistent behaviour across proxies and CDNs.
+
+### ✅ Benar — kebab-case URL paths
+
+```go
+r.GET("/api/template-plan/:id", c.GetTemplate)
+r.POST("/api/persona-profile/answers", c.SubmitAnswers)
+```
+
+### Quick mental model
+
+| Surface | Casing | Example |
+|---|---|---|
+| JSON body keys | `snake_case` | `"user_id": "abc"` |
+| URL path segment | `kebab-case` | `/api/template-plan` |
+| URL path param | `kebab-case` | `:user-id` |
+| URL query param | `kebab-case` | `?date-from=2026-04-25` |
+| HTTP header | `Pascal-Kebab` | `X-Auth-Cron` |
+| Internal Go field | `PascalCase` | `UserID uuid.UUID` |
+
+Boundary conversion is the controller's job (`json:"..."`, `form:"..."` tags + `c.Param("...")`). Use_case and repository layers never see the wire casing.
+
+---
+
 ## Summary — when in doubt
 
 | Smell | Probably violates | Read |
@@ -512,3 +603,4 @@ Then either: refactor all in one PR, or open one ticket that lists all spots and
 | `time.Now().Location()` for "today" | Timezone (#13 + helpers) | Section H |
 | `time.LoadLocation(...)` outside `app/use_case/common/` | Reuse pkg/ (#10) | Section H.1 |
 | Many small bugs with same root cause | Audit-before-fix (#3) | Section I |
+| `json:"camelCase"` / `form:"snake_case"` / underscore in URL path | REST surface naming (#17) | Section J |

@@ -73,6 +73,20 @@ The rules are grouped to make scanning easier; the numbering is global so you ca
 14. **Swagger annotations only on HTTP handler functions** in controllers — never on use_case, repository, or private helpers.
 15. **APM and structured logging** come last; require Phase 1–2 to be 99% complete (per `instruction_order.md`).
 16. **Comments are allowed** when they capture non-obvious WHY (constraints, invariants, surprising behaviour, workarounds with ticket links). They are **not** required and not encouraged for restating what well-named code already says. Emojis in log messages and `.env` examples are fine in this codebase.
+17. **No camelCase anywhere on the REST surface. Two casing buckets only:**
+    - **JSON body keys** (request body, response body, error envelope) → `snake_case`. `created_at`, `user_id`, `due_at`, `tag_ids`. Never `createdAt`, `userId`, `dueAt`. Internal Go fields stay `PascalCase`; the conversion happens at the boundary via `json:"snake_case"` struct tags.
+    - **Everything in the URL** (path segments, path params, query param names) → `kebab-case`. Never snake_case, never camelCase.
+      - URL path: `/api/template-plan/:id/history`, `/api/persona-profile/answers` — not `/api/template_plan` and not `/api/templatePlan`.
+      - Path params: `:id`, `:user-id`, `:tag-id` — not `:user_id` and not `:userId`. Read with `c.Param("user-id")`, declare in `form:"user-id"` if bound via struct.
+      - Query params: `?date-from=`, `?page-size=`, `?sort-by=` — not `?date_from=` and not `?dateFrom=`. Bind via `form:"date-from"` tags on the request struct.
+    - **HTTP headers** are exempt: they follow `Pascal-Kebab-Case` per RFC convention (`X-Auth-Cron`, `X-API-Key`, `Authorization`). Never `xAuthCron`.
+
+    Three checkpoints to enforce, all caught by `tools/lint.sh`:
+    - Every `json:"..."` tag value in `app/controller/<feature>/models.go` is snake_case (or `json:"-"` for hidden fields). Lint flags `json:"camelCase"`.
+    - Every `form:"..."` tag value is kebab-case. Lint flags `form:"snake_case"` and `form:"camelCase"`.
+    - Every route string in `routes/routes.go` uses kebab path segments and kebab path params. Lint flags any `_` or uppercase letter inside a `r.<METHOD>("/api/...")` path string.
+
+    Why this split: URL is one namespace (kebab is the URL-native casing — case-insensitive, hyphen-tolerant); JSON is another (snake_case is the JSON-native casing per most ecosystems). Mixing them inside one of the two leaks ambiguity. Frontend/mobile teams in this ecosystem standardise on this split — diverging forces per-field mappers in every consumer.
 
 ## Mandatory reading order
 

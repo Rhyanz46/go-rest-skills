@@ -127,6 +127,39 @@ report_violation 12 "placeholder/TODO comment likely guarding a no-op (verify th
 m=$(scan 'func\s+\(\w+\s+\*?\w+Repository\w*\)\s+(GetBy|FindBy|ListBy)\w+' app/repository)
 report_violation 8 "repository method named GetBy/FindBy/ListBy<X> (use Filter struct on GetOne/List instead)" "$m"
 
+# ---- Rule #17: REST surface naming ------------------------------------------
+
+# (a) JSON body keys must be snake_case — flag camelCase in json: tag
+# Pattern: json:"<lower><any><Upper>...
+m=$(scan 'json:"[a-z][a-zA-Z0-9_]*[A-Z]' app/controller)
+report_violation 17 "json: tag value contains uppercase (use snake_case)" "$m"
+
+# (b) Query / form / uri params must be kebab-case — flag underscore or uppercase in form/uri tag
+m=$(scan 'form:"[a-z]+_[a-z0-9_]+"' app/controller)
+report_violation 17 "form: tag value uses snake_case (use kebab-case)" "$m"
+
+m=$(scan 'form:"[a-z][a-zA-Z0-9_-]*[A-Z]' app/controller)
+report_violation 17 "form: tag value contains uppercase (use kebab-case)" "$m"
+
+m=$(scan 'uri:"[a-z]+_[a-z0-9_]+"' app/controller)
+report_violation 17 "uri: tag value uses snake_case (use kebab-case)" "$m"
+
+m=$(scan 'uri:"[a-z][a-zA-Z0-9_-]*[A-Z]' app/controller)
+report_violation 17 "uri: tag value contains uppercase (use kebab-case)" "$m"
+
+# (c) Route strings must use kebab path segments + kebab path params
+# Find r.<METHOD>("/api/...") declarations with underscore or uppercase inside the path string
+m=$(scan 'r\.(GET|POST|PUT|DELETE|PATCH|OPTIONS|HEAD)\("[^"]*_[^"]*"' routes)
+report_violation 17 "route path contains underscore (use kebab-case for segments and :params)" "$m"
+
+m=$(scan 'r\.(GET|POST|PUT|DELETE|PATCH|OPTIONS|HEAD)\("/[a-z][a-zA-Z0-9_/:-]*[A-Z]' routes)
+report_violation 17 "route path contains uppercase (use kebab-case)" "$m"
+
+# (d) c.Param / c.Query keys with snake_case — these usually mirror the route param,
+# so this catches drift where you renamed the route but forgot the lookup
+m=$(scan 'c\.(Param|Query)\("[a-z]+_[a-z0-9_]+"\)' app/controller)
+report_violation 17 "c.Param/Query lookup uses snake_case key (must match kebab-case route param)" "$m"
+
 # ---- Rule #13: output timestamps stay UTC -----------------------------------
 
 # Detect .In(<loc>) inside transform.go files (heuristic — the function name "transform" is the smell)
