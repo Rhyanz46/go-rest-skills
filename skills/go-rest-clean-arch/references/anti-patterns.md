@@ -585,6 +585,104 @@ Boundary conversion is the controller's job (`json:"..."`, `form:"..."` tags + `
 
 ---
 
+## K. Internal errors leaking to clients (rule #18)
+
+### ❌ Salah — raw `err.Error()` shipped to client at 5xx
+
+```go
+// app/controller/track_controller/controller.go
+resp, code, err := ctrl.useCase.GetTrack(c.Request.Context(), id)
+if err != nil {
+    c.JSON(code, gin.H{"error": err.Error()})   // ← leaks DB / internal detail
+    return
+}
+```
+
+When the DB times out and use_case returns `(nil, 500, errors.New("dial tcp 10.0.0.5:5432: connection refused"))`, the client gets that exact string. Now an attacker knows your internal subnet, and a frontend has to render database error strings in a popup. Plus there's no `request_id` for support to grep with.
+
+### ❌ Salah — manually crafted error response per controller
+
+```go
+if err != nil {
+    if code >= 500 {
+        log.Println("internal error:", err)
+        c.JSON(code, gin.H{"message": "something went wrong"})
+        return
+    }
+    c.JSON(code, gin.H{"message": err.Error()})
+    return
+}
+```
+
+Better than the first version, but every controller now repeats the 4xx-vs-5xx branch. Drift inevitable: one controller forgets to log, another forgets to return `request_id`, a third leaks the original error in a 503.
+
+### ✅ Benar — single chokepoint via `common.SendError`
+
+```go
+import "github.com/<owner>/something-backend/app/controller/common"
+
+resp, code, err := ctrl.useCase.GetTrack(c.Request.Context(), id)
+if err != nil {
+    common.SendError(c, code, err)   // does the right thing for 4xx and 5xx
+    return
+}
+common.SendSuccess(c, code, resp)
+```
+
+`SendError` handles:
+- 4xx → returns `err.Error()` to client (caller-facing message).
+- 5xx → logs `request_id`, method, path, user_id, and original `err`; returns generic `"internal server error"` + `request_id` to client.
+
+Controllers stay short; sanitization can't be forgotten because the helper enforces it.
+
+### ❌ Salah — request_id only in `gin.Context`, not in `context.Context`
+
+```go
+// middleware
+c.Set("request_id", id)
+c.Next()
+
+// use_case (downstream)
+func (r *trackUseCase) GetTrack(ctx context.Context, id uint) (*Track, int, error) {
+    log.Printf("fetching track %d", id)   // ← no request_id here
+    // ...
+}
+```
+
+The use_case never sees `gin.Context` (rule #7), so it can't log the `request_id`. When the DB error occurs three layers down, the log line has no correlation key. Incident triage = 🔥.
+
+### ✅ Benar — `context.Context` carries the ID through every layer
+
+```go
+// middleware sets BOTH
+c.Set("request_id", id)
+c.Request = c.Request.WithContext(common_utils.WithRequestID(c.Request.Context(), id))
+
+// use_case logs with the ID, no gin dependency
+func (r *trackUseCase) GetTrack(ctx context.Context, id uint) (*Track, int, error) {
+    if err := r.somethingRisky(ctx); err != nil {
+        log.Printf("[track_use_case] request_id=%s err=%v",
+            common_utils.RequestIDFrom(ctx), err)
+        return nil, http.StatusInternalServerError, err
+    }
+    // ...
+}
+```
+
+Now `grep request_id=abc-123` returns every log line for the failing request: middleware ⇒ controller ⇒ use_case ⇒ repo ⇒ DB error.
+
+### Smell test for code reviewers
+
+| Smell | Likely violating |
+|---|---|
+| `c.JSON(...err.Error()...)` in a controller | rule #18 (b) — 5xx sanitization |
+| `gin.H{"error": ...}` shape returned | rule #18 (b) and rule #10 (response envelope) |
+| `log.Printf` in use_case without `RequestIDFrom(ctx)` | rule #18 (c) — structured logging |
+| No `X-Request-ID` in response header | rule #18 (a) — middleware not wired |
+| Request-id read from `c.GetString("request_id")` inside use_case | rule #7 — auth-context-style leak; use `RequestIDFrom(ctx)` instead |
+
+---
+
 ## Summary — when in doubt
 
 | Smell | Probably violates | Read |
@@ -604,3 +702,5 @@ Boundary conversion is the controller's job (`json:"..."`, `form:"..."` tags + `
 | `time.LoadLocation(...)` outside `app/use_case/common/` | Reuse pkg/ (#10) | Section H.1 |
 | Many small bugs with same root cause | Audit-before-fix (#3) | Section I |
 | `json:"camelCase"` / `form:"snake_case"` / underscore in URL path | REST surface naming (#17) | Section J |
+| `c.JSON(...err.Error()...)` or `gin.H{"error": ...}` from controller | 5xx sanitization (#18) | Section K |
+| use_case `log.Printf` without `RequestIDFrom(ctx)` | request_id propagation (#18) | Section K |

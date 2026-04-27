@@ -160,6 +160,30 @@ report_violation 17 "route path contains uppercase (use kebab-case)" "$m"
 m=$(scan 'c\.(Param|Query)\("[a-z]+_[a-z0-9_]+"\)' app/controller)
 report_violation 17 "c.Param/Query lookup uses snake_case key (must match kebab-case route param)" "$m"
 
+# ---- Rule #18: 5xx sanitization + request_id propagation --------------------
+
+# (a) Controllers must not call c.JSON with err.Error() anywhere in the call —
+# multiline mode catches `c.JSON(code, ErrorResponse{... Message: err.Error() ...})`
+if have_rg; then
+    m=$(rg --multiline --multiline-dotall -n --no-heading \
+        'c\.JSON\([^)]{0,400}err\.Error\(\)' \
+        app/controller 2>/dev/null || true)
+else
+    m=$(scan 'c\.JSON\([^)]*err\.Error\(\)' app/controller)
+fi
+report_violation 18 "controller passes err.Error() through c.JSON (use common.SendError to sanitize 5xx)" "$m"
+
+# (b) Controllers must not return raw gin.H error shapes (covered partly by rule #10, restated here)
+m=$(scan 'c\.JSON\([^)]*gin\.H\{[^}]*"error"' app/controller)
+report_violation 18 "controller returns ad-hoc gin.H error shape (use common.SendError)" "$m"
+
+# (c) use_case / repository log lines should include request_id from context.
+# Heuristic: log.Printf without RequestIDFrom mention in the same line. False
+# positive prone, so report as advisory.
+m=$(scan 'log\.(Printf|Println|Print|Errorf|Warnf|Infof)\(' app/use_case app/repository)
+filtered=$(printf '%s' "$m" | grep -v 'RequestIDFrom\|request_id=' || true)
+report_violation 18 "log line below the controller layer without request_id from context (advisory: include common_utils.RequestIDFrom(ctx))" "$filtered"
+
 # ---- Rule #13: output timestamps stay UTC -----------------------------------
 
 # Detect .In(<loc>) inside transform.go files (heuristic — the function name "transform" is the smell)

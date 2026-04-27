@@ -91,7 +91,7 @@ Empty Go packages will fail to build — Step 4 fills them.
 
 ## Step 4 — Drop in the shared utilities
 
-These four packages are **prerequisites** for the skill's hard rules. Without them, rule #10 ("reuse pkg/") is impossible.
+These packages are **prerequisites** for the skill's hard rules. Without them, rule #10 (reuse `pkg/`), rule #17 (REST surface naming via `SendError`/`SendSuccess`), and rule #18 (request_id propagation + 5xx sanitization) are impossible to satisfy.
 
 ### `pkg/paginate_utils/`
 
@@ -203,34 +203,115 @@ func EndOfDayInTZ(t time.Time, loc *time.Location) time.Time {
 }
 ```
 
+### `pkg/common_utils/request_context.go`
+
+The request_id key + helpers used by every layer to read the current request ID from `context.Context` (rule #18 part a). Lives in `pkg/common_utils/` so use_case/repository can import it without pulling gin.
+
+```go
+package common_utils
+
+import "context"
+
+type ctxKey string
+
+const RequestIDKey ctxKey = "request_id"
+
+func WithRequestID(ctx context.Context, id string) context.Context {
+    return context.WithValue(ctx, RequestIDKey, id)
+}
+
+func RequestIDFrom(ctx context.Context) string {
+    v, _ := ctx.Value(RequestIDKey).(string)
+    return v
+}
+```
+
+### `pkg/http_middleware/request_id.go`
+
+Generates or accepts an `X-Request-ID`, propagates it into `gin.Context` AND `context.Context`, echoes it in the response header. Wire this **before** any other middleware (auth, logging, etc.) so logs from middleware errors still carry the ID.
+
+```go
+package http_middleware
+
+import (
+    "github.com/<owner>/something-backend/pkg/common_utils"
+
+    "github.com/gin-gonic/gin"
+    "github.com/google/uuid"
+)
+
+func RequestID(c *gin.Context) {
+    id := c.GetHeader("X-Request-ID")
+    if id == "" {
+        id = uuid.NewString()
+    }
+
+    c.Header("X-Request-ID", id)
+    c.Set("request_id", id)
+    c.Request = c.Request.WithContext(common_utils.WithRequestID(c.Request.Context(), id))
+
+    c.Next()
+}
+```
+
 ### `app/controller/common/response.go`
+
+`SendError` is the single chokepoint for error responses. It does the **5xx sanitization** automatically (rule #18 part b) and **logs the original error** with the request ID (part c). Controllers never call `c.JSON(...)` for errors directly.
 
 ```go
 package common
 
 import (
+    "log"
+
     "github.com/gin-gonic/gin"
 )
 
 type SuccessResponse struct {
-    Success bool        `json:"success"`
-    Message string      `json:"message,omitempty"`
-    Data    interface{} `json:"data,omitempty"`
+    Success   bool        `json:"success"`
+    Message   string      `json:"message,omitempty"`
+    Data      interface{} `json:"data,omitempty"`
+    RequestID string      `json:"request_id,omitempty"`
 }
 
 type ErrorResponse struct {
-    Success bool   `json:"success"`
-    Message string `json:"message"`
+    Success   bool   `json:"success"`
+    Message   string `json:"message"`
+    RequestID string `json:"request_id,omitempty"`
 }
 
 const CtxKeyUserID = "user_id"
 
 func SendSuccess(c *gin.Context, statusCode int, data interface{}) {
-    c.JSON(statusCode, SuccessResponse{Success: true, Data: data})
+    c.JSON(statusCode, SuccessResponse{
+        Success: true, Data: data, RequestID: c.GetString("request_id"),
+    })
 }
 
-func SendError(c *gin.Context, statusCode int, msg string) {
-    c.JSON(statusCode, ErrorResponse{Success: false, Message: msg})
+// SendError converts a (statusCode, err) pair into a sanitized HTTP response.
+// For 5xx the original err is logged and never sent to the client; the client
+// gets a generic message + request_id so support can grep logs by ID. For 4xx
+// the err.Error() is surfaced — it's meant for the caller.
+func SendError(c *gin.Context, statusCode int, err error) {
+    requestID := c.GetString("request_id")
+
+    if statusCode >= 500 {
+        userID, _ := c.Get(CtxKeyUserID)
+        log.Printf("[5xx] request_id=%s method=%s path=%s user_id=%v err=%v",
+            requestID, c.Request.Method, c.Request.URL.Path, userID, err)
+        c.JSON(statusCode, ErrorResponse{
+            Success: false, Message: "internal server error", RequestID: requestID,
+        })
+        return
+    }
+
+    msg := "request failed"
+    if err != nil {
+        msg = err.Error()
+    }
+    c.JSON(statusCode, ErrorResponse{
+        Success: false, Message: msg, RequestID: requestID,
+    })
 }
 
 func GetUserIDFromContext(c *gin.Context) (interface{}, bool) {
@@ -386,12 +467,16 @@ func NewControllers(useCases *use_case.UseCases) *Controllers {
 
 ## Step 7 — Routes scaffolding
 
+`http_middleware.RequestID` must run **first**, before any other middleware, so every log line (including from auth-middleware errors) carries the ID.
+
 ```go
 // routes/routes.go
 package routes
 
 import (
     "github.com/<owner>/something-backend/app/controller"
+    "github.com/<owner>/something-backend/pkg/http_middleware"
+
     "github.com/gin-gonic/gin"
 )
 
@@ -401,6 +486,11 @@ type RouterDependencies struct {
 
 func SetupRoutes(deps *RouterDependencies) *gin.Engine {
     r := gin.Default()
+
+    // Global middleware — order matters: RequestID first so other middleware
+    // can include it in their log lines.
+    r.Use(http_middleware.RequestID)
+
     setupAuthenticatedRoutes(r, deps.Controllers)
     return r
 }
@@ -570,7 +660,9 @@ git commit --author="<Name> <email>" -m "Bootstrap project on go-rest-clean-arch
 - [ ] `make lint-arch` exits 0.
 - [ ] `CLAUDE.md` exists at repo root and pins a specific skill version.
 - [ ] **No `ai_instruction/` directory** in the repo.
-- [ ] All four shared utility packages exist (`pkg/paginate_utils/`, `app/use_case/common/`, `app/controller/common/`, `app/repository/common/`).
+- [ ] All shared utility packages exist (`pkg/paginate_utils/`, `pkg/common_utils/request_context.go`, `pkg/http_middleware/request_id.go`, `app/use_case/common/`, `app/controller/common/`, `app/repository/common/`).
+- [ ] `RequestID` middleware wired in `routes/routes.go` **before** any other middleware.
+- [ ] Hitting any endpoint with `curl -i ...` returns an `X-Request-ID` response header (rule #18 verification).
 - [ ] Three central structs (`Repositories`, `UseCases`, `Controllers`) compile empty.
 
 If every box is checked, the project is ready for the first feature — open `feature-recipe.md` and follow it.

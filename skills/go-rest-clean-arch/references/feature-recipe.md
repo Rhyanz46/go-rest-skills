@@ -336,6 +336,8 @@ var ListRemindersRules = map_validator.BuildRoles().
 
 ### `controller.go` — canonical handler shape
 
+Every error path goes through `common.SendError`, which sanitizes 5xx and logs with `request_id` (rule #18). Every success goes through `common.SendSuccess` (rule #10). **Never call `c.JSON(...)` directly.**
+
 ```go
 // app/controller/reminders_controller/controller.go
 // @Summary      Create reminder
@@ -349,23 +351,32 @@ var ListRemindersRules = map_validator.BuildRoles().
 // @Router       /reminders [post]
 func (ctrl *remindersController) Create(c *gin.Context) {
     userID, ok := common.GetUserIDFromContext(c)
-    if !ok { c.JSON(http.StatusUnauthorized, common.ErrorResponse{Message: "unauthenticated"}); return }
+    if !ok {
+        common.SendError(c, http.StatusUnauthorized, errors.New("unauthenticated"))
+        return
+    }
     ownerID, _ := uuid.Parse(userID.(string))
 
     req, err := map_validator.ValidateJSON[CreateReminderRequest](c.Request, CreateReminderRules)
-    if err != nil { c.JSON(http.StatusBadRequest, common.ErrorResponse{Message: err.Error()}); return }
+    if err != nil {
+        common.SendError(c, http.StatusBadRequest, err)
+        return
+    }
 
     dueAt, _ := time.Parse(time.RFC3339, req.DueAt.Format(time.RFC3339))   // already validated by rule
     resp, code, err := ctrl.useCase.Create(c.Request.Context(), ownerID, reminders_use_case.CreateReminderRequest{
         Title: req.Title, DueAt: dueAt,
     })
-    if err != nil { c.JSON(code, common.ErrorResponse{Message: err.Error()}); return }
+    if err != nil {
+        common.SendError(c, code, err)   // 4xx → err.Error() to client; 5xx → "internal server error" + request_id, real err logged
+        return
+    }
 
-    c.JSON(code, common.SuccessResponse{Data: resp})
+    common.SendSuccess(c, code, resp)
 }
 ```
 
-The pattern is always: extract `userID` → validate request → call use_case with the trio `(*gin.Context's context, ownerID, request)` → forward `(result, statusCode, error)` to gin.
+The pattern is always: extract `userID` → validate request → call use_case with the trio `(c.Request.Context(), ownerID, request)` → forward `(result, statusCode, error)` to `common.SendError` / `common.SendSuccess`. The handler never decides 4xx vs 5xx messaging — `SendError` does that based on the status code.
 
 ---
 
@@ -484,6 +495,9 @@ Same template per layer. Don't chain.
 - [ ] Validation rules in `rules.go` package-level vars; no `binding:` tags in models (rule #9)
 - [ ] Three constructor files updated (`repositories.go`, `use_cases.go`, `controllers.go`)
 - [ ] Routes registered in `routes/routes.go` `setupAuthenticatedRoutes`
-- [ ] `go build ./...` passes; existing tests still green
+- [ ] All wire formats follow the casing buckets: snake_case JSON keys, kebab-case URL paths/params/query, Pascal-Kebab headers (rule #17)
+- [ ] Every error path uses `common.SendError(c, code, err)`; no direct `c.JSON(...)` for errors (rule #18)
+- [ ] Use_case / repository log lines include `common_utils.RequestIDFrom(ctx)` (rule #18)
+- [ ] `go build ./...` passes; existing tests still green; `make lint-arch` exits 0
 
 If any box is unchecked, the feature isn't done — fix it before opening the PR.

@@ -87,6 +87,34 @@ The rules are grouped to make scanning easier; the numbering is global so you ca
     - Every route string in `routes/routes.go` uses kebab path segments and kebab path params. Lint flags any `_` or uppercase letter inside a `r.<METHOD>("/api/...")` path string.
 
     Why this split: URL is one namespace (kebab is the URL-native casing — case-insensitive, hyphen-tolerant); JSON is another (snake_case is the JSON-native casing per most ecosystems). Mixing them inside one of the two leaks ambiguity. Frontend/mobile teams in this ecosystem standardise on this split — diverging forces per-field mappers in every consumer.
+18. **Internal errors stay internal; clients see only `request_id` for 5xx.** Three coupled requirements:
+
+    **(a) Request ID propagation.** Every incoming request must carry a `request_id` from the edge through every layer down to the repository:
+    - A `RequestID` middleware (in `pkg/http_middleware/`) reads `X-Request-ID` from the header or generates a new UUID if absent.
+    - It writes the ID into both `gin.Context` (for handlers) and the underlying `context.Context` (so `r.repo.GetOne(ctx, ...)` and downstream calls inherit it).
+    - It echoes the ID back in `X-Request-ID` response header on every response.
+    - A typed key + helpers live in `pkg/common_utils/request_context.go`: `WithRequestID(ctx, id)`, `RequestIDFrom(ctx) string`. Layers below the controller read the ID via `RequestIDFrom(ctx)` for logging, never from `gin.Context` (that would re-introduce the auth-context leak banned by rule #7).
+
+    **(b) Error sanitization at the controller boundary.** When a use_case or repository returns `(_, statusCode, err)` with `statusCode >= 500`, the controller must NOT pass `err.Error()` to the client. The body returned to the client for any 5xx is a fixed shape:
+    ```json
+    { "success": false, "message": "internal server error", "request_id": "abc-123-..." }
+    ```
+    The original `err` is logged server-side (see (c)). For `statusCode < 500` (4xx — validation, business errors, not-found, conflict), `err.Error()` IS surfaced to the client because those messages are meant for the caller. The split is:
+    - `4xx` → caller-facing message, `err.Error()` is fine.
+    - `5xx` → generic message + `request_id`; the real reason is in the log.
+    
+    Enforce via `app/controller/common/response.go`'s `SendError(c, statusCode, err)` helper which performs the sanitization automatically. **Controllers must never call `c.JSON(...)` directly with an error payload.** Always go through `common.SendError`.
+
+    **(c) Structured logging at every 5xx.** When `SendError` sees `statusCode >= 500`, it logs one line containing at minimum:
+    - `request_id`
+    - HTTP method + path
+    - User ID (if authenticated, via `common.GetUserIDFromContext`)
+    - Original `err` value (and stack trace if available)
+    - Timestamp
+    
+    Logs from below the controller (use_case, repository) that want to participate in incident triage must include `RequestIDFrom(ctx)` in their log line — same key, so `grep request_id=abc-123` returns every line for the offending request.
+
+    **Why this rule:** during an incident, the only thing the user can copy out of the browser is the `request_id`. Without it, you grep logs by timestamp and pray. With it, one `grep` returns the full request lifecycle: middleware → controller → use_case → repo → DB error. The rule pays for itself the first time production breaks.
 
 ## Mandatory reading order
 
