@@ -128,6 +128,37 @@ import "planner-backend/app/repository/friends_repository"   // OK
 
 Grep that should be empty in a clean repo: `rg 'database/schemas' app/use_case/`.
 
+### B.2 — Depending on a concrete struct instead of the layer's interface
+
+```go
+// app/use_case/track_use_case/interfaces.go
+type UseCaseDependencies struct {
+    TrackRepo *track_repository.trackRepository   // ← concrete unexported struct
+}
+```
+
+Symptoms:
+- The use_case can't be tested without spinning up a real GORM connection.
+- A bug in `*trackRepository.GetOne` is impossible to substitute with a fake.
+- Refactoring the repo (renaming a method, adding a parameter) silently breaks every consumer because there's no contract to look at.
+
+### ✅ Benar — depend on the interface the layer publishes
+
+```go
+// app/use_case/track_use_case/interfaces.go
+type UseCaseDependencies struct {
+    TrackRepo track_repository.TrackRepository    // ← exported interface
+}
+
+// app/repository/track_repository/interfaces.go is the single place that
+// declares TrackRepository — same package as its concrete implementation
+// (provider-defined, not consumer-defined; see rule #6).
+```
+
+The same shape applies one layer up: controllers depend on `XUseCase` (interface), never on `*xUseCase` (concrete). Wiring in `app/controller/controllers.go` always assigns interface fields.
+
+Quick smell test: any field in a `Dependencies` struct (`UseCaseDependencies`, `RepositoryDependencies`, `ControllerDependencies`) whose type is a pointer to a lowercase-named struct — that's depending on a concrete unexported struct, which is a violation.
+
 ---
 
 ## C. Auth context leak (rule #7)
@@ -470,6 +501,7 @@ Then either: refactor all in one PR, or open one ticket that lists all spots and
 | `GetByX`, `FindByY` repo methods | Filter Pattern (#8) | Section A |
 | GORM tags in JSON response | Three-model rule (#6) | Section B |
 | `import "...database/schemas"` in `app/use_case/` | Layer dependency (#4) | Section B.1 |
+| Dependencies struct holding `*lowercaseStruct` | Interface contract (#6) | Section B.2 |
 | `*gin.Context` below controller | Auth leak (#7) | Section C |
 | `(result, error)` from repo | Error trio (#5) | Section D |
 | Loop with `repo.GetOne` inside | N+1 (#11) | Section E |

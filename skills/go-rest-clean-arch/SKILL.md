@@ -37,12 +37,15 @@ The rules are grouped to make scanning easier; the numbering is global so you ca
 
 4. **Layer dependency direction is one-way.** Controller depends on use_case, use_case depends on repository. Never the other direction. No business logic in controllers, no HTTP types in use_case, no GORM types leaking out of repository.
 5. **Signature `(result, statusCode int, error)` is mandatory below the controller.** Every public method on a repository or use_case returns this trio. The controller is the only place that converts `int` → HTTP response. Do not return `(result, error)` and let the controller "assume 500"; do not return `(int, error)` without a result; do not invent ad-hoc error wrappers per feature.
-6. **Three sets of models, transform at every boundary.**
-   - `app/repository/<feature>/models.go` speaks GORM (struct tags, schema imports, primary keys).
-   - `app/use_case/<feature>/interfaces.go` speaks domain (no GORM tags, no `gin.Context`, no JSON tags).
-   - `app/controller/<feature>/models.go` speaks HTTP (request/response shapes, JSON tags, no GORM tags).
+6. **Each layer owns its own contract — both interface AND models.** Three pieces per feature, three layers:
+   - **Repository layer** owns `XRepository` interface in `app/repository/<feature>/interfaces.go` *plus* GORM-aware models in `models.go` (struct tags, schema imports). The use_case calls the **interface**, never the concrete `*xRepository` struct.
+   - **Use_case layer** owns `XUseCase` interface in `app/use_case/<feature>/interfaces.go` *plus* domain-level structs (no GORM tags, no `gin.Context`, no JSON tags). The controller calls the **interface**, never the concrete `*xUseCase` struct.
+   - **Controller layer** owns `XController` interface in `app/controller/<feature>/interfaces.go` *plus* HTTP DTOs in `models.go` (`json:` tags only, no GORM tags). Routes call the **interface**.
 
-   Conversion happens in dedicated transform helpers (`transformXToY`). Never re-use a single struct across two layers — even if the fields look identical today, the layers will drift.
+   Three corollaries:
+   - **Interfaces are provider-defined.** The package that *implements* the interface is the same package that *defines* it. This is intentionally Java-flavoured rather than Go-idiomatic small consumer-defined interfaces — the project chose unified per-layer contracts so each feature has one obvious "API surface" to read. Don't try to "fix" it by moving interfaces into consumer packages.
+   - **Callers depend on interfaces, never on concrete structs.** A `Controllers` field typed `*track_use_case.trackUseCase` is wrong; it must be `track_use_case.TrackUseCase`. Same for repos in use_cases.
+   - **Conversions between layers happen in dedicated transform helpers** (`transformXToY` in `transform.go`). Never re-use a single struct across two layers — even if the fields look identical today, the layers will drift. Same goes for interfaces — never alias `XRepository` as `XUseCase` to skip a transform; that's a layering smell.
 7. **Auth context (`GetAuthClaim`, `c.Get("user_id")`, `*gin.Context`) lives only in the controller.** Use_case and repository receive `userID uuid.UUID` (or whatever IDs they need) as explicit parameters. A repository signature that takes a `*gin.Context` is automatically wrong.
 
 ### Layer-specific patterns
