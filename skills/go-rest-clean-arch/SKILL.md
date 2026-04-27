@@ -317,6 +317,52 @@ The rules are grouped to make scanning easier; the numbering is global so you ca
     7. For external-service references, add (or confirm existence of) the periodic reconciliation job.
 
     **Why:** orphaned rows are a slow-burning data-quality fire. They compound over time, distort analytics, break foreign-key-aware ORMs, and eventually surface as "the dashboard shows wrong totals" or "deleted user's tracks still appear in shared views". Cascade discipline at write time is 10× cheaper than data-cleanup migrations later. Pen-testers also probe for orphan-shaped IDOR (insecure direct object reference) bugs — a stale row pointing at a deleted user is a classic privilege-escalation vector.
+24. **No silent numeric narrowing or sign conversion.** Go's numeric type casts truncate or wrap **silently** with no error. Any cast that narrows (e.g. `int → uint16`, `int64 → int32`) or changes signedness (`int → uint*`) on a value derived from external input is a data-corruption hazard and must be guarded.
+
+    Canonical bug shape:
+
+    ```go
+    // request comes in as { "priority": -1 }; map_validator gives us *int with value -1.
+    record.Priority = uint16(*in.Priority)        // ← becomes 65535. No error. Saved to DB.
+    ```
+
+    Same class of bug:
+    - `int32(largeInt64)` → wraps when the value exceeds `2^31 - 1`. Bank ledger off by `4 billion`.
+    - `int(uint64Value)` on 32-bit platforms → silent overflow.
+    - `byte(rune)` on a non-ASCII rune → wrong character, not a panic.
+
+    **Two acceptable defenses (pick one per cast site):**
+
+    **(a) Constrain the range at validation, then narrow.** Whenever the wire field is a bounded numeric (port number, DNS priority, percentage, age), the `rules.go` declaration in the controller layer enforces the range. By the time the use_case sees the value, it's already in `[min, max]` and the cast is safe.
+
+    ```go
+    // app/controller/dns_controller/rules.go
+    var CreateRecordRules = map_validator.BuildRoles().
+        SetRule("priority", map_validator.Int().Between(0, 65535).Nullable())
+
+    // app/use_case/dns_use_case/usecase.go — safe to narrow because validation guarantees range
+    record.Priority = uint16(*req.Priority)
+    ```
+
+    **(b) Bounds-check explicitly before the cast.** When validation can't enforce the range (value comes from another internal system, computed at runtime, etc.), check before narrowing and return an explicit error.
+
+    ```go
+    if v < 0 || v > math.MaxUint16 {
+        return http.StatusBadRequest, fmt.Errorf("priority %d out of range [0, 65535]", v)
+    }
+    p := uint16(v)
+    ```
+
+    **Hard prohibitions:**
+    - Never `uint8/16/32(x)` or `int8/16/32(x)` on a `*int` / `int64` / `uint64` from external input without a preceding validation rule **or** an explicit bounds check on the same code path.
+    - Never assume "it's small enough" — if the type can hold a wider range, the validator must say so. Optimism is not a guard.
+    - Sign conversion (`int → uint*`) is the highest-risk variant: a single negative value from a buggy client silently inflates to a huge unsigned number.
+
+    **Tools:**
+    - `gosec` (`golangci-lint --enable=gosec`) flags `G115` (integer overflow conversion) — wire into CI alongside `tools/lint.sh`.
+    - The skill's lint script flags the most common narrowing-cast-on-pointer-deref shape (`uint16(*x)`, `int32(*x)`).
+
+    **Why:** every silent narrowing is a stored data corruption waiting to detonate. The bug is invisible at write (no error, no panic), survives the test suite (you never test priority=-1 because "obviously you wouldn't"), and surfaces months later as "why is this DNS record served with priority 65535?". The validator-side constraint is one line in `rules.go` and it eliminates the entire class.
 
 ## Mandatory reading order
 

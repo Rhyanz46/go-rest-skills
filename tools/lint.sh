@@ -334,6 +334,19 @@ if have_rg; then
     report_violation 23 "advisory: soft-delete symmetry not statically verifiable; manual review required" "$bad"
 fi
 
+# ---- Rule #24: no silent numeric narrowing ---------------------------------
+
+# Most common shape: narrowing/sign-converting cast on a pointer dereference,
+# which strongly implies the value came from a request struct. Heuristic — flag
+# all hits in app/use_case and app/controller; review each.
+m=$(scan '\b(uint8|uint16|uint32|int8|int16|int32)\(\*' app)
+report_violation 24 "narrowing/sign-converting cast on pointer dereference (verify range was validated in rules.go or add explicit bounds check)" "$m"
+
+# Bare cast int→uint* on a non-literal — flag for review. False positive prone.
+m=$(scan '\b(uint8|uint16|uint32|uint|uint64)\([a-z][A-Za-z0-9_.]*\)' app | grep -v '_test\.go:' || true)
+filtered=$(printf '%s' "$m" | grep -vE 'uint(8|16|32|64)?\(0\)|uint(8|16|32|64)?\(1\)' || true)
+report_violation 24 "advisory: int→uint cast on a variable (verify source ≥ 0)" "$filtered"
+
 # ---- Rule #13: output timestamps stay UTC -----------------------------------
 
 # Detect .In(<loc>) inside transform.go files (heuristic — the function name "transform" is the smell)

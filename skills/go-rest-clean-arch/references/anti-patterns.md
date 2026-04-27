@@ -1307,6 +1307,101 @@ Open the PR description with which option you picked and why. Reviewers verify a
 
 ---
 
+## Q. Silent numeric narrowing / sign conversion (rule #24)
+
+### ❌ Salah — narrowing cast on user input without range validation
+
+```go
+// rules.go — no Between() constraint
+var CreateRecordRules = map_validator.BuildRoles().
+    SetRule("priority", map_validator.Int().Nullable())
+
+// use_case
+record.Priority = uint16(*req.Priority)
+```
+
+Client sends `{ "priority": -1 }` (typo, malicious, off-by-one in frontend). The use_case happily produces `record.Priority = 65535` and writes it to the DB. No error, no log, no panic. Six months later someone notices "why is this MX record served with priority 65535?".
+
+Same shape, different bug:
+
+```go
+record.Port = uint16(*req.Port)        // -1 → 65535, 70000 → 4464 (wrap)
+record.Age  = uint8(*req.AgeYears)     // 256 → 0, -3 → 253
+amount     := int32(req.AmountInt64)   // 3 billion → -1.3 billion
+```
+
+Every one of these is a stored data corruption.
+
+### ✅ Benar (a) — constrain at validation, then narrow
+
+```go
+// rules.go — single source of truth for the range
+var CreateRecordRules = map_validator.BuildRoles().
+    SetRule("priority", map_validator.Int().Between(0, 65535).Nullable()).
+    SetRule("port",     map_validator.Int().Between(1, 65535)).
+    SetRule("age_years",map_validator.Int().Between(0, 150))
+
+// use_case — safe; validation already rejected anything out of range
+record.Priority = uint16(*req.Priority)
+record.Port     = uint16(*req.Port)
+record.Age      = uint8(*req.AgeYears)
+```
+
+`Between(min, max)` runs at the controller boundary. By the time the use_case sees the value, the range is guaranteed.
+
+### ✅ Benar (b) — bounds-check explicitly when validation can't reach
+
+```go
+// computed elsewhere, not from user input — no validation rule applies
+v := computeWeight(...)
+if v < 0 || v > math.MaxUint16 {
+    return http.StatusInternalServerError, fmt.Errorf("computed weight %d out of range", v)
+}
+record.Weight = uint16(v)
+```
+
+Use this when the value's source is internal (another computation, an upstream API), so the validator can't help.
+
+### ❌ Salah — sign conversion across a struct boundary
+
+```go
+type DBRecord struct {
+    Count uint64
+}
+
+// elsewhere
+totalRequests := int64(record.Count)   // safe direction
+delta := int64(record.Count) - prev    // also safe — int64 fits uint64 only up to 2^63
+
+// danger:
+delta := record.Count - uint64(prev)   // if prev > record.Count → wraps to giant uint64
+```
+
+Subtraction across `uint64` is the silent-corruption variant. If the result could go negative, do the math in `int64` (or `*big.Int`) and convert back only after a bounds check.
+
+### Cheat sheet — narrow safely
+
+| Cast | Always safe? | Guard |
+|---|---|---|
+| `int8/16/32 → int64`, `uint8/16/32 → uint64` | ✓ widening | None needed |
+| `int → uint*` | **No** — sign conversion | Range-validate (≥0) or bounds-check |
+| `int64 → int32` | **No** — narrowing | Range-validate or bounds-check |
+| `uint64 → int64` | **No** — value > 2^63 wraps | Bounds-check `< math.MaxInt64` |
+| `int → uint16/8` | **No** — sign + narrow | Range-validate or bounds-check |
+| `byte(rune)` | **No** — non-ASCII corrupts | Don't; use `string(rune)` for chars |
+| `float64 → int64` | **No** — truncates + NaN/Inf undefined | Check `math.IsNaN/IsInf` and bounds |
+
+### Enforcement
+
+- `gosec` (`golangci-lint run --enable=gosec`) flags `G115` (integer overflow conversion). Wire into CI.
+- `tools/lint.sh` flags the most common shape: `uint8/16/32(*x)` or `int8/16/32(*x)` on pointer dereferences (likely from request structs). Heuristic — review each hit.
+
+### One-liner mental rule
+
+> If the destination type cannot hold every value the source type can produce, you must prove (via validation or runtime check) that this particular value fits. Silent casts have shipped real bugs; explicit bounds have not.
+
+---
+
 ## Summary — when in doubt
 
 | Smell | Probably violates | Read |
@@ -1340,3 +1435,5 @@ Open the PR description with which option you picked and why. Reviewers verify a
 | FK or m2m without `constraint:OnDelete:...` declared | Orphan prevention (#23) | Section P |
 | Soft-delete on parent, hard-delete (or no delete) on children | Orphan prevention (#23) | Section P |
 | External-service 404 crashes list endpoint | Orphan prevention (#23) | Section P |
+| `uint16(*req.X)` / `int32(longInt64)` without prior range check | Numeric narrowing (#24) | Section Q |
+| Subtraction on `uint*` that can go negative | Numeric narrowing (#24) | Section Q |
