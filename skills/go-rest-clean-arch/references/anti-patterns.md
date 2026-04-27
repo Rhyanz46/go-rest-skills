@@ -890,6 +890,191 @@ If you spawn a goroutine in this codebase, it must satisfy at least one of:
 
 ---
 
+## N. Sequential third-party calls in a list loop (rule #21)
+
+### ❌ Salah — sequential blocking calls
+
+```go
+func (r *friendsUseCase) ListFriends(ctx context.Context, ownerID uuid.UUID) ([]Friend, int, error) {
+    friends, _, _, _ := r.friendsRepo.List(ctx, FriendFilter{OwnerID: &ownerID}, nil)
+
+    for i := range friends {
+        profile, err := r.accountClient.GetProfile(ctx, friends[i].UserID)  // ← 200ms × N items
+        if err == nil {
+            friends[i].Username = profile.Username
+        }
+    }
+
+    return friends, http.StatusOK, nil
+}
+```
+
+50 friends × 200ms each = **10 seconds**. The user thinks the app is broken.
+
+### ❌ Salah — unbounded fan-out
+
+```go
+var wg sync.WaitGroup
+for i := range friends {
+    i := i
+    wg.Add(1)
+    go func() {
+        defer wg.Done()
+        profile, _ := r.accountClient.GetProfile(ctx, friends[i].UserID)
+        friends[i].Username = profile.Username
+    }()
+}
+wg.Wait()
+```
+
+50 friends → 50 simultaneous requests. Account-service rate-limits or throttles. Your egress bill spikes. Errors silently dropped (rule #19 violation too). And if list grows to 5,000 items, you've just DDoSed a teammate's service.
+
+### ✅ Benar — bounded fan-out via `errgroup`
+
+```go
+import (
+    "golang.org/x/sync/errgroup"
+    "github.com/<owner>/something-backend/pkg/common_utils"
+)
+
+func (r *friendsUseCase) ListFriends(ctx context.Context, ownerID uuid.UUID) ([]Friend, int, error) {
+    friends, _, _, _ := r.friendsRepo.List(ctx, FriendFilter{OwnerID: &ownerID}, nil)
+
+    g, gctx := errgroup.WithContext(ctx)
+    g.SetLimit(10)                                  // at most 10 concurrent calls
+
+    for i := range friends {
+        i := i                                      // capture index
+        g.Go(func() error {
+            profile, err := r.accountClient.GetProfile(gctx, friends[i].UserID)
+            if err != nil {
+                log.Printf("[friends.enrich] request_id=%s user_id=%s err=%v",
+                    common_utils.RequestIDFrom(gctx), friends[i].UserID, err)
+                return nil                          // tolerate per-item failure
+            }
+            friends[i].Username = profile.Username
+            return nil
+        })
+    }
+    if err := g.Wait(); err != nil {
+        return nil, http.StatusInternalServerError, err
+    }
+
+    return friends, http.StatusOK, nil
+}
+```
+
+50 friends with `SetLimit(10)` → **~1 second** total. Account-service sees a controlled trickle. Errors are logged with `request_id` for triage. If the third-party goes hard-down, `g.Wait()` returns the error and the controller returns a 500.
+
+### Three rules of thumb when deciding fan-out vs sequential
+
+| Per-item operation | Fan out? | Why |
+|---|---|---|
+| DB query (`r.repo.X(ctx, ...)`) | **No** — batch fetch (rule #11) | DB pool is finite, shared across requests |
+| HTTP call to internal/third-party service | **Yes**, bounded (rule #21) | HTTP pool tolerates parallelism; latency dominates |
+| Pure CPU work (transform, sort) | Usually no, single goroutine | Goroutine overhead > work |
+| Mixed (HTTP + transform) | Fan out the HTTP, transform in the same goroutine | Don't pipeline unless N is very large |
+
+### Common mistakes inside the goroutine body
+
+| Mistake | Fix |
+|---|---|
+| `g.Go(func() error { return r.accountClient.GetProfile(ctx, ...) })` — uses outer `ctx` | Use `gctx` (errgroup-derived) so failures cancel siblings |
+| Forgetting `i := i` before `g.Go(...)` | Loop variable capture; without it, every goroutine sees the last `i` |
+| Returning the per-item error from `g.Go` | Hard-fails the whole list on one bad row; usually you want to log + return nil |
+| Unbounded `g.Go` with no `SetLimit` | Same as `sync.WaitGroup` mistake — 5,000 simultaneous calls |
+| Mutating `items[i]` from the goroutine without thinking about it | Safe **only** because each goroutine writes a different index. Don't append to a shared slice without a mutex |
+
+### N.1 — Channel-based fan-out (when streaming or worker pool fits better than errgroup)
+
+Two valid alternatives exist when `errgroup` is too coarse:
+
+**(a) Bounded semaphore via buffered `chan struct{}`** — same shape as errgroup, but you own the goroutines. Use this when you want to start streaming results to the caller (SSE, WebSocket) the moment each item is ready.
+
+```go
+sem := make(chan struct{}, 10)
+results := make(chan EnrichedItem, len(items))
+var wg sync.WaitGroup
+
+for i := range items {
+    wg.Add(1)
+    select {
+    case sem <- struct{}{}:                       // acquire (blocks if 10 in flight)
+    case <-ctx.Done():
+        wg.Done()
+        continue                                  // request cancelled — stop spawning
+    }
+    go func(i int) {
+        defer wg.Done()
+        defer func() { <-sem }()                  // release on every return path
+        profile, err := r.accountClient.GetProfile(ctx, items[i].UserID)
+        if err != nil {
+            log.Printf("[enrich] request_id=%s user_id=%s err=%v",
+                common_utils.RequestIDFrom(ctx), items[i].UserID, err)
+            results <- EnrichedItem{Item: items[i]}
+            return
+        }
+        results <- EnrichedItem{Item: items[i], Username: profile.Username}
+    }(i)
+}
+
+go func() { wg.Wait(); close(results) }()
+
+for r := range results {
+    // stream to client immediately, or accumulate
+}
+```
+
+**(b) Worker pool with job + result channels** — fixed N workers, each draining `jobs` and emitting on `results`. Reuse this when the same set of workers serves many requests (e.g. an app-wide enricher service) or when jobs have wildly varying durations and you want fairness.
+
+```go
+jobs := make(chan int, len(items))                // buffered to avoid blocking the producer
+results := make(chan EnrichedItem, len(items))
+
+const workers = 10
+var wg sync.WaitGroup
+for w := 0; w < workers; w++ {
+    wg.Add(1)
+    go func() {
+        defer wg.Done()
+        for i := range jobs {
+            select {
+            case <-ctx.Done():
+                return                            // stop on cancel
+            default:
+            }
+            profile, err := r.accountClient.GetProfile(ctx, items[i].UserID)
+            // ... build EnrichedItem ...
+            results <- enriched
+        }
+    }()
+}
+
+for i := range items { jobs <- i }
+close(jobs)                                       // signal workers no more work
+go func() { wg.Wait(); close(results) }()
+
+for r := range results { /* drain */ }
+```
+
+### Hard rules when reaching for raw channels (rule #20 + rule #21)
+
+| Rule | Why |
+|---|---|
+| Exactly one goroutine closes a given channel | Closing twice panics; closing a channel another goroutine is writing to panics |
+| `for r := range ch` requires `close(ch)` somewhere | Without close → deadlock |
+| Buffered channels = bounded concurrency; unbuffered = synchronisation | Pick deliberately, don't default to unbuffered |
+| Acquire/release a semaphore slot must respect `<-ctx.Done()` | `sem <- struct{}{}` blocks forever if pool is full and ctx is cancelled — hidden goroutine leak |
+| `defer func() { <-sem }()` immediately after `sem <- struct{}{}` | Mirror `defer cancel()` discipline; release on every return path including panics |
+
+### When errgroup is enough — don't reinvent it
+
+If your needs are: **fan out N independent calls, wait for all, surface first error, bound concurrency** — that's literally what `errgroup` does in 5 lines. Channels are for the cases errgroup can't handle (streaming, worker pool, multi-stage pipelines). Don't write 30 lines of channel choreography for a problem errgroup solves in 5.
+
+---
+
+---
+
 ## Summary — when in doubt
 
 | Smell | Probably violates | Read |
@@ -915,3 +1100,6 @@ If you spawn a goroutine in this codebase, it must satisfy at least one of:
 | Single-value type assertion `i.(T)` outside test code | Never ignore errors (#19) | Section L |
 | `context.WithTimeout/Cancel/Deadline` without `defer cancel()` | Resource cleanup (#20) | Section M |
 | `http.Response.Body` not closed; goroutine without context exit | Resource cleanup (#20) | Section M |
+| Sequential third-party calls in a list loop (10s+ latency) | Bounded fan-out (#21) | Section N |
+| Unbounded `go func()` over a list of items | Bounded fan-out (#21) | Section N |
+| Closing a channel twice or writing to a closed channel | Channel discipline (#20+#21) | Section N.1 |

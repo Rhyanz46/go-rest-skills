@@ -58,6 +58,7 @@ go get gorm.io/driver/sqlite
 go get github.com/google/uuid
 go get github.com/joho/godotenv
 go get github.com/rhyanz46/map_validator
+go get golang.org/x/sync/errgroup
 ```
 
 Optional but recommended:

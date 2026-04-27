@@ -145,6 +145,92 @@ The rules are grouped to make scanning easier; the numbering is global so you ca
     The skill's `tools/lint.sh` carries a few shell-level smells (e.g. `context.WithCancel` with no nearby `defer cancel`), but Go's static analysis tooling is the real backstop. Wire it into CI alongside `lint-arch`.
 
     **Why:** a leaked goroutine silently consumes memory and DB connections until the pod OOM-kills. A leaked `resp.Body` exhausts the HTTP client's connection pool. Both bugs look fine in dev (tiny load, short uptime) and only surface under sustained traffic — i.e. exactly when you can't iterate fast.
+21. **Bounded fan-out for independent third-party calls in list endpoints.** When a list response needs to enrich N items by calling an external HTTP service (account-service profile lookup, billing, geocoding, etc.), the calls run in parallel via `golang.org/x/sync/errgroup`, **not** sequentially. The shape:
+
+    ```go
+    import "golang.org/x/sync/errgroup"
+
+    g, gctx := errgroup.WithContext(ctx)
+    g.SetLimit(10)                                 // bounded concurrency
+    for i := range items {
+        i := i                                     // capture per-iteration
+        g.Go(func() error {
+            profile, err := r.accountClient.GetProfile(gctx, items[i].UserID)
+            if err != nil {
+                log.Printf("[enrich] request_id=%s user_id=%s err=%v",
+                    common_utils.RequestIDFrom(gctx), items[i].UserID, err)
+                return nil                         // tolerate per-item failure; don't break the whole list
+            }
+            items[i].Username = profile.Username
+            return nil
+        })
+    }
+    if err := g.Wait(); err != nil {
+        return nil, http.StatusInternalServerError, err
+    }
+    ```
+
+    **Read this with rule #11**, which bans concurrent fan-out for DB calls. The two rules don't contradict — they apply to different downstreams:
+    - **DB** has a finite connection pool sized for the whole app. Fanning out 100 queries from one request will starve every other in-flight request. Rule #11 says batch-fetch instead.
+    - **HTTP to a third-party service** has its own per-host pool (typically larger, tunable on the `http.Client`), and the bottleneck is round-trip latency, not your local connection pool. Rule #21 says fan out, but **bounded** (`g.SetLimit(10)` typically; never unbounded `for { go f() }`).
+
+    Constraints:
+    - Use **`errgroup.WithContext`**, not bare `sync.WaitGroup`. errgroup gives you ctx-cancellation, first-error short-circuit, and bounded concurrency in one type.
+    - Set a concrete **`SetLimit`** — `10` is the default starting point. Never spawn `len(items)` goroutines unbounded; you'll DDoS the third-party and your egress cost will spike.
+    - Per-item failures should usually be **tolerated** (return `nil` from the goroutine, log with `request_id`) so one flaky third-party row doesn't break the whole list response. Hard failures bubble via `g.Wait()`.
+    - The goroutine must read `gctx` (the errgroup-derived context), not the outer `ctx`. errgroup's context is cancelled the moment any goroutine returns a non-nil error — the rest stop early instead of wasting calls.
+
+    **When to reach for raw channels instead of errgroup.** errgroup is the canonical because it bundles bounded concurrency + ctx cancellation + error propagation in 5 lines. But channels are the underlying primitive and the right tool when:
+
+    - **Streaming**: results need to be consumed as they arrive (e.g. write each enriched item to an SSE/WebSocket the moment it's ready, instead of buffering the whole list).
+    - **Worker pool with a job queue**: a fixed pool of N workers drains a `chan Job` and emits to a `chan Result` — useful when the same workers are reused across multiple requests, or when jobs take wildly varying times.
+    - **Backpressure**: a buffered channel `chan struct{}` of size N acts as a counting semaphore — workers `<- sem` before doing work and `sem <-` after; exceeds N → block.
+
+    Canonical channel-semaphore + WaitGroup fan-out (use this when errgroup doesn't fit):
+
+    ```go
+    sem := make(chan struct{}, 10)           // bounded to 10 concurrent
+    results := make(chan EnrichedItem, len(items))
+    var wg sync.WaitGroup
+
+    for i := range items {
+        wg.Add(1)
+        sem <- struct{}{}                    // acquire slot (blocks if 10 in flight)
+        go func(i int) {
+            defer wg.Done()
+            defer func() { <-sem }()         // release slot
+            profile, err := r.accountClient.GetProfile(ctx, items[i].UserID)
+            if err != nil {
+                log.Printf("[enrich] request_id=%s user_id=%s err=%v",
+                    common_utils.RequestIDFrom(ctx), items[i].UserID, err)
+                results <- EnrichedItem{Item: items[i]}   // partial result is OK
+                return
+            }
+            results <- EnrichedItem{Item: items[i], Username: profile.Username}
+        }(i)
+    }
+
+    go func() { wg.Wait(); close(results) }() // close drains the for-range below
+
+    for r := range results {
+        // process as they come in (stream to client, etc.)
+    }
+    ```
+
+    Rules around channels (these are mandatory whenever you reach for them):
+    - **Always have one writer or document the close discipline.** Whoever closes the channel should be the only writer, or all writers must coordinate. Closing a channel that another goroutine is writing to panics.
+    - **`for range chan` requires the channel to be closed.** Forgetting `close(results)` deadlocks the range loop forever.
+    - **Buffered channels for bounded concurrency**, unbuffered channels for synchronisation. Pick deliberately.
+    - **The channel itself must respect ctx**: workers should `select { case sem <- struct{}{}: case <-ctx.Done(): return }` so cancellation actually unblocks. errgroup hides this; raw channels make you do it explicitly.
+
+    **Choose the simplest tool that fits:** errgroup for "enrich a list with parallel calls and wait for all", channels for streaming / worker-pool / fancy backpressure. If you find yourself reinventing errgroup with channels, just use errgroup.
+
+    **Tools:**
+    - `golang.org/x/sync/errgroup` — canonical fan-out + wait + first-error.
+    - `golang.org/x/sync/semaphore.NewWeighted(n)` — typed semaphore alternative to `chan struct{}`.
+    - `golang.org/x/time/rate.Limiter` — when the third-party has explicit RPS limits.
+
+    **Why:** a `GET /api/friends` that returns 50 friends, each enriched with a 200ms call to account-service, takes 10 seconds sequentially. With `SetLimit(10)`, it takes ~1 second. The user perceives the app as broken if list endpoints take > 2s. This rule is the difference between "snappy" and "users open a support ticket".
 
 ## Mandatory reading order
 
