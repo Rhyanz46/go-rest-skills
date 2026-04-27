@@ -475,6 +475,9 @@ func NewControllers(useCases *use_case.UseCases) *Controllers {
 package routes
 
 import (
+    "log"
+    "os"
+
     "github.com/<owner>/something-backend/app/controller"
     "github.com/<owner>/something-backend/pkg/http_middleware"
 
@@ -492,8 +495,35 @@ func SetupRoutes(deps *RouterDependencies) *gin.Engine {
     // can include it in their log lines.
     r.Use(http_middleware.RequestID)
 
+    setupSwagger(r)                              // gated by SWAGGER_USER / SWAGGER_PASSWORD (rule #22)
     setupAuthenticatedRoutes(r, deps.Controllers)
     return r
+}
+
+// setupSwagger registers /swagger/* only when both SWAGGER_USER and
+// SWAGGER_PASSWORD are present in the loaded config. Without them the
+// route is never created, so /swagger/index.html returns a clean 404
+// (rule #22). Production typically leaves the env unset.
+func setupSwagger(r *gin.Engine) {
+    // Replace these accessors with whatever your config struct exposes.
+    user := os.Getenv("SWAGGER_USER")
+    pass := os.Getenv("SWAGGER_PASSWORD")
+    if user == "" || pass == "" {
+        log.Println("⚠️  swagger disabled (SWAGGER_USER / SWAGGER_PASSWORD not set)")
+        return
+    }
+
+    // Uncomment when you wire the swag generator + ginSwagger in go.mod:
+    //
+    //   import (
+    //       ginSwagger "github.com/swaggo/gin-swagger"
+    //       "github.com/swaggo/files"
+    //   )
+    //
+    //   swag := r.Group("/swagger", gin.BasicAuth(gin.Accounts{user: pass}))
+    //   swag.GET("/*any", ginSwagger.WrapHandler(swaggerFiles.Handler))
+    log.Println("📘 swagger enabled at /swagger (basic auth required)")
+    _, _ = user, pass                             // silence unused warnings before swag wiring
 }
 
 func setupAuthenticatedRoutes(r *gin.Engine, ctrls *controller.Controllers) {

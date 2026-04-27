@@ -1075,6 +1075,89 @@ If your needs are: **fan out N independent calls, wait for all, surface first er
 
 ---
 
+## O. Swagger UI exposed without auth (rule #22)
+
+### ❌ Salah — Swagger registered unconditionally, no auth
+
+```go
+// routes/routes.go
+func SetupRoutes(deps *RouterDependencies) *gin.Engine {
+    r := gin.Default()
+    r.GET("/swagger/*any", ginSwagger.WrapHandler(swaggerFiles.Handler))   // ← anyone can read
+    setupAuthenticatedRoutes(r, deps.Controllers)
+    return r
+}
+```
+
+A pen-test scanner finds `/swagger/index.html` in 2 minutes. They now have your full API surface, every parameter, every error model, and the bearer-token scheme — enough to plan a targeted attack without ever logging in.
+
+### ❌ Salah — credentials hardcoded
+
+```go
+swag := r.Group("/swagger", gin.BasicAuth(gin.Accounts{
+    "admin": "admin123",                                  // ← in source, in git history forever
+}))
+swag.GET("/*any", ginSwagger.WrapHandler(swaggerFiles.Handler))
+```
+
+Now the password is in every git commit, every CI log, every grep. Rotating it requires a code change.
+
+### ❌ Salah — falls back to empty credentials when env unset
+
+```go
+user := os.Getenv("SWAGGER_USER")        // "" if unset
+pass := os.Getenv("SWAGGER_PASSWORD")    // "" if unset
+
+swag := r.Group("/swagger", gin.BasicAuth(gin.Accounts{user: pass}))   // {"": ""}
+swag.GET("/*any", ginSwagger.WrapHandler(swaggerFiles.Handler))
+```
+
+`gin.Accounts{"": ""}` is undefined territory — depending on framework version it may accept any (or no) credentials. Even if it consistently rejects, the route still *exists*, leaks WWW-Authenticate hints, and gives an attacker something to brute-force.
+
+### ✅ Benar — gate on env presence, then BasicAuth
+
+```go
+func setupSwagger(r *gin.Engine) {
+    user := config.APP.Rest.SwaggerUser
+    pass := config.APP.Rest.SwaggerPassword
+    if user == "" || pass == "" {
+        log.Println("⚠️  swagger disabled (SWAGGER_USER / SWAGGER_PASSWORD not set)")
+        return                                       // route never registered → 404
+    }
+    swag := r.Group("/swagger", gin.BasicAuth(gin.Accounts{user: pass}))
+    swag.GET("/*any", ginSwagger.WrapHandler(swaggerFiles.Handler))
+    log.Println("📘 swagger enabled at /swagger (basic auth required)")
+}
+```
+
+Operational effects:
+
+| Environment | `SWAGGER_USER`/`SWAGGER_PASSWORD` | `/swagger/*` returns |
+|---|---|---|
+| Production | unset | 404 (route doesn't exist) |
+| Staging (internal-only) | set to non-empty | 401 without creds, 200 with creds |
+| Local dev | set in `.env` | 401 without creds, 200 with creds |
+| Anonymous attacker | any env | 404 in prod, 401 elsewhere — never 200 |
+
+### Verification
+
+After deploy, confirm the gate works:
+
+```bash
+# production (env unset) → expect 404
+curl -i https://api.example.com/swagger/index.html
+
+# staging (env set) — without auth → expect 401
+curl -i https://staging.example.com/swagger/index.html
+
+# staging — with auth → expect 200
+curl -i -u "$SWAGGER_USER:$SWAGGER_PASSWORD" https://staging.example.com/swagger/index.html
+```
+
+If production returns 200 or 401 (instead of 404), the gate is broken. Fix immediately and audit access logs.
+
+---
+
 ## Summary — when in doubt
 
 | Smell | Probably violates | Read |
@@ -1103,3 +1186,5 @@ If your needs are: **fan out N independent calls, wait for all, surface first er
 | Sequential third-party calls in a list loop (10s+ latency) | Bounded fan-out (#21) | Section N |
 | Unbounded `go func()` over a list of items | Bounded fan-out (#21) | Section N |
 | Closing a channel twice or writing to a closed channel | Channel discipline (#20+#21) | Section N.1 |
+| `ginSwagger.WrapHandler` registered without `gin.BasicAuth` | Swagger gating (#22) | Section O |
+| Swagger creds hardcoded or derived from possibly-empty env | Swagger gating (#22) | Section O |

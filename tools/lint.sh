@@ -278,6 +278,33 @@ if have_rg; then
     report_violation 20 "time.NewTicker without nearby 'defer ticker.Stop()'" "$leak_lines"
 fi
 
+# ---- Rule #22: swagger gated by basic auth + env ---------------------------
+
+# Find every swagger registration (ginSwagger.WrapHandler / swaggerFiles.Handler).
+# For each, check that the same file mentions BOTH `gin.BasicAuth` AND an env-
+# presence guard ("if user ==" or `SwaggerUser` / `SwaggerPassword` /
+# `SWAGGER_USER` / `SWAGGER_PASSWORD` reference). Missing either → flag.
+if have_rg; then
+    swag_files=$(rg -l --no-heading 'ginSwagger\.WrapHandler|swaggerFiles\.Handler' routes app pkg 2>/dev/null || true)
+    bad=""
+    for f in $swag_files; do
+        [[ -z "$f" || ! -f "$f" ]] && continue
+        body=$(cat "$f")
+        has_basicauth=$(printf '%s' "$body" | grep -c 'gin\.BasicAuth' || true)
+        has_envgate=$(printf '%s' "$body" | grep -cE 'SwaggerUser|SwaggerPassword|SWAGGER_USER|SWAGGER_PASSWORD' || true)
+        if [[ "$has_basicauth" -eq 0 || "$has_envgate" -eq 0 ]]; then
+            bad+="${f}: swagger registered without BasicAuth + env presence gate"$'\n'
+        fi
+    done
+    bad="${bad%$'\n'}"
+    report_violation 22 "swagger UI exposed without BasicAuth gated on SWAGGER_USER/SWAGGER_PASSWORD env presence" "$bad"
+fi
+
+# Hardcoded credentials in BasicAuth — anything that isn't a variable lookup.
+# Pattern: gin.Accounts{"some-literal": "another-literal"}
+m=$(scan 'gin\.Accounts\{"[^"]+": ?"[^"]+"\}' routes app pkg)
+report_violation 22 "swagger BasicAuth uses hardcoded credentials (must come from config/env)" "$m"
+
 # ---- Rule #13: output timestamps stay UTC -----------------------------------
 
 # Detect .In(<loc>) inside transform.go files (heuristic — the function name "transform" is the smell)

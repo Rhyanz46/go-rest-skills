@@ -231,6 +231,36 @@ The rules are grouped to make scanning easier; the numbering is global so you ca
     - `golang.org/x/time/rate.Limiter` — when the third-party has explicit RPS limits.
 
     **Why:** a `GET /api/friends` that returns 50 friends, each enriched with a 200ms call to account-service, takes 10 seconds sequentially. With `SetLimit(10)`, it takes ~1 second. The user perceives the app as broken if list endpoints take > 2s. This rule is the difference between "snappy" and "users open a support ticket".
+22. **Swagger UI is gated by Basic Auth from config; without credentials it does not exist.** The Swagger doc surface (`/swagger/*`) is a security-sensitive endpoint — it leaks the entire API shape, every parameter, every error model, and the bearer-token scheme. It must never be reachable anonymously.
+
+    Two requirements:
+    
+    **(a) Always protected by HTTP Basic Auth.** Credentials come from environment variables `SWAGGER_USER` and `SWAGGER_PASSWORD` (or whichever naming the project's `config/` uses — match the rest of `config.APP.Rest.*`). Apply `gin.BasicAuth` to the swagger route group. Never hardcode credentials.
+    
+    **(b) Auto-disable when credentials are absent.** If either env var is empty, **the swagger routes must not be registered at all**. A request to `/swagger/index.html` returns 404 — same as any other unrouted path. Do not register the routes with empty credentials and rely on `gin.BasicAuth` to reject — empty credentials in `gin.Accounts{"": ""}` is undefined behaviour and may accept anonymous access.
+
+    Canonical wiring in `routes/routes.go`:
+
+    ```go
+    func setupSwagger(r *gin.Engine) {
+        user := config.APP.Rest.SwaggerUser
+        pass := config.APP.Rest.SwaggerPassword
+        if user == "" || pass == "" {
+            log.Println("⚠️  swagger disabled (SWAGGER_USER / SWAGGER_PASSWORD not set)")
+            return                                          // routes never registered
+        }
+        swag := r.Group("/swagger", gin.BasicAuth(gin.Accounts{user: pass}))
+        swag.GET("/*any", ginSwagger.WrapHandler(swaggerFiles.Handler))
+        log.Println("📘 swagger enabled at /swagger (basic auth required)")
+    }
+    ```
+
+    Three operational consequences:
+    - **Production**: keep `SWAGGER_USER` and `SWAGGER_PASSWORD` unset to disable Swagger entirely. Internal staging may set them.
+    - **CI / scanners**: any pen-test that finds an unauthenticated `/swagger/index.html` is a hard-fail bug — file it immediately.
+    - **Adding a new env**: `config/init_helpers.go` reads the two env vars unconditionally; the gate is only at the route registration site, so the config struct is the single source of truth.
+
+    **Why:** Swagger UI is a friendly attack surface. It documents every authenticated endpoint, every parameter shape, every error condition. An attacker scanning your domain finds it once and has a complete reconnaissance map for free. Even read-only access leaks more than is comfortable. Treat it like an admin panel, not a public doc page.
 
 ## Mandatory reading order
 
