@@ -305,6 +305,35 @@ fi
 m=$(scan 'gin\.Accounts\{"[^"]+": ?"[^"]+"\}' routes app pkg)
 report_violation 22 "swagger BasicAuth uses hardcoded credentials (must come from config/env)" "$m"
 
+# ---- Rule #23: orphan prevention --------------------------------------------
+
+# (a) GORM many2many tag without a `constraint:` clause → no documented policy
+# Pattern: `gorm:"many2many:..."` with no `constraint:` mentioned in the tag.
+m=$(scan 'gorm:"[^"]*many2many:[^"]*"' database/schemas)
+filtered=$(printf '%s' "$m" | grep -v 'constraint:' || true)
+report_violation 23 "many2many relation without 'constraint:OnDelete/OnUpdate' — orphan policy not declared" "$filtered"
+
+# (b) foreignKey tag without constraint:OnDelete
+m=$(scan 'gorm:"[^"]*foreignKey:[^"]*"' database/schemas)
+filtered=$(printf '%s' "$m" | grep -v 'constraint:' || true)
+report_violation 23 "foreignKey relation without 'constraint:OnDelete' — orphan policy not declared" "$filtered"
+
+# (c) Soft-delete asymmetry — flag schemas that use gorm.DeletedAt and also
+# reference an m2m join. Heuristic only: surface the file so the reviewer can
+# verify the join table also has gorm.DeletedAt or hard-delete is intentional.
+if have_rg; then
+    soft_delete_files=$(rg -l --no-heading 'gorm\.DeletedAt' database/schemas 2>/dev/null || true)
+    bad=""
+    for f in $soft_delete_files; do
+        [[ -z "$f" || ! -f "$f" ]] && continue
+        if grep -q 'many2many:' "$f"; then
+            bad+="${f}: schema uses gorm.DeletedAt and many2many — verify join table soft-delete symmetry"$'\n'
+        fi
+    done
+    bad="${bad%$'\n'}"
+    report_violation 23 "advisory: soft-delete symmetry not statically verifiable; manual review required" "$bad"
+fi
+
 # ---- Rule #13: output timestamps stay UTC -----------------------------------
 
 # Detect .In(<loc>) inside transform.go files (heuristic — the function name "transform" is the smell)

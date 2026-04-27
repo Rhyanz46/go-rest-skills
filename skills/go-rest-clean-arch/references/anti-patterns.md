@@ -1158,6 +1158,155 @@ If production returns 200 or 401 (instead of 404), the gate is broken. Fix immed
 
 ---
 
+## P. Orphaned data — children left behind after parent deletes (rule #23)
+
+### ❌ Salah — m2m join table not cleaned up when parent is deleted
+
+```go
+// schemas/track.go
+type DailyTrack struct {
+    ID   uint  `gorm:"primaryKey"`
+    Tags []Tag `gorm:"many2many:track_tags;"`   // ← no constraint
+}
+
+// repo
+func (r *trackRepository) Delete(ctx context.Context, filter TrackFilter) (int, error) {
+    return r.db.WithContext(ctx).Where("id = ?", *filter.Id).Delete(&schemas.DailyTrack{}).Error
+}
+```
+
+After deleting track `42`:
+- `daily_tracks` row gone ✓
+- `track_tags` rows where `track_id = 42` **still exist** → orphans
+- Listing tags by track ID returns rows pointing at a non-existent track. Eventually a foreign-key-aware migration tool refuses to run.
+
+### ✅ Benar — DB cascade on the m2m relation
+
+```go
+type DailyTrack struct {
+    ID   uint  `gorm:"primaryKey"`
+    Tags []Tag `gorm:"many2many:track_tags;constraint:OnDelete:CASCADE,OnUpdate:CASCADE"`
+}
+```
+
+Now deleting the parent removes the join rows in the same DB statement. No extra Go code.
+
+### ❌ Salah — child has FK but no policy declared
+
+```go
+// schemas/recurring_application_log.go
+type RecurringApplicationLog struct {
+    ID             uint
+    TemplatePlanID uint  `gorm:"not null;index"`   // ← references template_plans.id
+}
+```
+
+The schema records "this log belongs to a template plan" but neither the DB nor the use_case enforces what happens when the template is deleted. Three months later, `recurring_application_logs` is full of rows pointing at deleted templates. Operators ask "why does the count of total applications keep growing for a template that doesn't exist?".
+
+### ✅ Benar — pick one of the three policies, write it down
+
+```go
+// Option (a): DB-level cascade — owned by template, gone with template.
+type RecurringApplicationLog struct {
+    ID             uint
+    TemplatePlanID uint         `gorm:"not null;index"`
+    TemplatePlan   TemplatePlan `gorm:"foreignKey:TemplatePlanID;constraint:OnDelete:CASCADE"`
+}
+
+// Option (b): explicit cleanup in use_case (transactional).
+func (r *templatePlanUseCase) DeleteTemplate(ctx context.Context, id uint, ownerID uuid.UUID) (int, error) {
+    return r.repo.WithTx(ctx, func(tx *gorm.DB) (int, error) {
+        if err := tx.Where("template_plan_id = ?", id).Delete(&schemas.RecurringApplicationLog{}).Error; err != nil {
+            return http.StatusInternalServerError, err
+        }
+        if err := tx.Where("id = ? AND owner_user_id = ?", id, ownerID).Delete(&schemas.TemplatePlan{}).Error; err != nil {
+            return http.StatusInternalServerError, err
+        }
+        return http.StatusOK, nil
+    })
+}
+
+// Option (c): refuse with 409 if there are dependent rows.
+count, _, _ := r.repo.CountLogs(ctx, RecurringApplicationLogFilter{TemplatePlanID: &id})
+if count > 0 {
+    return http.StatusConflict, fmt.Errorf("cannot delete: %d application log(s) still reference this template", count)
+}
+```
+
+### ❌ Salah — soft-delete asymmetric (parent soft, child hard)
+
+```go
+type Tag struct {
+    ID        uint
+    DeletedAt gorm.DeletedAt `gorm:"index"`     // soft delete
+}
+
+type TrackTag struct {                          // join row — hard delete only
+    TrackID uint
+    TagID   uint
+}
+```
+
+Soft-delete a `Tag` → `tags.deleted_at = now()`. The `track_tags` rows still exist and still join successfully because GORM's soft-delete only filters reads on the same table. A track listing now joins to a "deleted" tag with no warning. Rolling back the soft-delete (un-delete) silently restores the relation — sometimes desirable, sometimes a bug, but rarely intentional.
+
+### ✅ Benar — soft-delete symmetric, or hard-delete throughout
+
+If the parent uses `gorm.DeletedAt`, the child relations either:
+- **Also use `gorm.DeletedAt`** and are soft-deleted in the same transaction (preserves audit trail; restore restores everything).
+- **Hard-delete in the same transaction** and accept that the relation is unrecoverable on parent restore.
+
+Pick one per relation and document it in the schema. Never mix.
+
+### ❌ Salah — external-service reference left dangling on enrichment 404
+
+```go
+profile, err := r.accountClient.GetProfile(ctx, friend.UserID)
+if err != nil {
+    return nil, http.StatusInternalServerError, err   // ← crashes the whole list
+}
+friend.Username = profile.Username
+```
+
+When account-service has deleted the user (404), our code returns 500 to the caller. One stale `friendships` row breaks the whole `/api/friends` endpoint.
+
+### ✅ Benar — tolerate the 404, log, render gracefully; reconcile periodically
+
+```go
+profile, err := r.accountClient.GetProfile(ctx, friend.UserID)
+if err != nil {
+    if errors.Is(err, accountclient.ErrUserNotFound) {
+        log.Printf("[friends.enrich] request_id=%s user_id=%s err=user_not_found",
+            common_utils.RequestIDFrom(ctx), friend.UserID)
+        friend.Username = "user_unknown"             // or filter out — product call
+        return nil
+    }
+    log.Printf("[friends.enrich] request_id=%s user_id=%s err=%v",
+        common_utils.RequestIDFrom(ctx), friend.UserID, err)
+    return nil                                       // tolerate transient errors too
+}
+friend.Username = profile.Username
+return nil
+```
+
+Then run a **periodic reconciliation** (cron, `x-auth-cron`-style endpoint, or external scheduler) that batches all referenced UUIDs, asks account-service which still exist, and soft-deletes (or hard-deletes per policy) local rows pointing at gone users. Without it, deleted users live forever in your DB as ghost references.
+
+### Review checklist on every schema-touching PR
+
+| # | Check |
+|---|---|
+| 1 | Listed every table that references the new/changed table (FK or logical). |
+| 2 | Each reference has a documented policy: CASCADE / explicit / refuse-409. |
+| 3 | If CASCADE: GORM tag `constraint:OnDelete:CASCADE` present on the schema. |
+| 4 | If explicit: use_case wraps both deletes in one transaction (rule #20). |
+| 5 | If refuse: controller returns 409 with a message naming what blocks the delete. |
+| 6 | Integration test: create parent + child, run delete path, assert no orphans. |
+| 7 | External-service refs: tolerate 404 on enrichment + reconciliation job exists. |
+| 8 | Soft-delete symmetric: parent uses `gorm.DeletedAt` ⇒ children also soft-delete or hard-delete in same tx. |
+
+Open the PR description with which option you picked and why. Reviewers verify against this list.
+
+---
+
 ## Summary — when in doubt
 
 | Smell | Probably violates | Read |
@@ -1188,3 +1337,6 @@ If production returns 200 or 401 (instead of 404), the gate is broken. Fix immed
 | Closing a channel twice or writing to a closed channel | Channel discipline (#20+#21) | Section N.1 |
 | `ginSwagger.WrapHandler` registered without `gin.BasicAuth` | Swagger gating (#22) | Section O |
 | Swagger creds hardcoded or derived from possibly-empty env | Swagger gating (#22) | Section O |
+| FK or m2m without `constraint:OnDelete:...` declared | Orphan prevention (#23) | Section P |
+| Soft-delete on parent, hard-delete (or no delete) on children | Orphan prevention (#23) | Section P |
+| External-service 404 crashes list endpoint | Orphan prevention (#23) | Section P |

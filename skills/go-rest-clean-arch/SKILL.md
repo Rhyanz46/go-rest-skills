@@ -261,6 +261,62 @@ The rules are grouped to make scanning easier; the numbering is global so you ca
     - **Adding a new env**: `config/init_helpers.go` reads the two env vars unconditionally; the gate is only at the route registration site, so the config struct is the single source of truth.
 
     **Why:** Swagger UI is a friendly attack surface. It documents every authenticated endpoint, every parameter shape, every error condition. An attacker scanning your domain finds it once and has a complete reconnaissance map for free. Even read-only access leaks more than is comfortable. Treat it like an admin panel, not a public doc page.
+23. **Always review for orphaned data. Every parent delete has an explicit cascade policy.** Whenever a row is deleted (hard or soft), every row that references it must follow a deliberate, documented strategy. Three legal options — pick one per parent/child relation, never leave it implicit:
+
+    **(a) DB-level cascade** — for owned-by relationships and m2m join tables. The child cannot exist without the parent, so the database enforces it.
+
+    ```go
+    // database/schemas/track.go
+    type DailyTrack struct {
+        ID     uint
+        UserID uuid.UUID
+        Tags   []Tag `gorm:"many2many:track_tags;constraint:OnDelete:CASCADE,OnUpdate:CASCADE"`
+    }
+
+    // join table behaves correctly: deleting a track removes its track_tags rows.
+    ```
+
+    **(b) Explicit cleanup in the use_case, in one transaction.** When the relationship is more than a simple owned-by (e.g. cross-feature, audit-logged), the use_case opens a transaction, deletes children explicitly, deletes parent, commits. Rule #20 (`defer tx.Rollback()`) applies.
+
+    ```go
+    func (r *templatePlanUseCase) DeleteTemplate(ctx context.Context, id uint, ownerID uuid.UUID) (int, error) {
+        return r.templatePlanRepo.WithTx(ctx, func(tx *gorm.DB) (int, error) {
+            if _, err := tx.Where("template_plan_id = ?", id).Delete(&schemas.RecurringApplicationLog{}).Error; err != nil {
+                return http.StatusInternalServerError, err
+            }
+            if _, err := tx.Where("id = ? AND owner_user_id = ?", id, ownerID).Delete(&schemas.TemplatePlan{}).Error; err != nil {
+                return http.StatusInternalServerError, err
+            }
+            return http.StatusOK, nil
+        })
+    }
+    ```
+
+    **(c) Refuse the delete with 409 Conflict** when children exist and orphaning them would lose data the operator might want to recover. The error tells the caller what blocks the delete:
+
+    ```go
+    count, _ := r.repo.CountChildren(ctx, parentID)
+    if count > 0 {
+        return http.StatusConflict, fmt.Errorf("cannot delete: %d dependent records still exist", count)
+    }
+    ```
+
+    **External-service references** (e.g. `owner_user_id` pointing at account-service) cannot cascade because the parent lives in another database. Two mitigations:
+    - **On enrichment failure** (account-service returns 404 for a user_id), tolerate it — render as `"user_unknown"` or omit the row, never crash. Log with `request_id` (rule #18).
+    - **Periodic reconciliation job** that scans referenced external IDs in batches and deletes/marks-deleted local rows whose external parent no longer exists. Schedule it like any cron task (`x-auth-cron` or platform scheduler), not in-process.
+
+    **Soft-delete symmetry.** If the parent uses GORM's `gorm.DeletedAt` (soft delete), every child relation either also soft-deletes (transactional, same `deleted_at` timestamp) or hard-deletes — but never stays alive while parent is soft-gone. A child query returning rows whose parent has `deleted_at != NULL` is a bug.
+
+    **Mandatory review checklist** — apply this on every PR that adds a schema, adds a foreign key, or changes a delete-handler:
+    1. List every table that holds a column referencing this one (FK or logical).
+    2. For each, declare the policy: CASCADE / explicit / refuse-409.
+    3. If CASCADE: verify the GORM tag (`constraint:OnDelete:CASCADE`) is on the schema and migration was run.
+    4. If explicit: verify the use_case wraps both deletes in one transaction (rule #20).
+    5. If refuse: verify the controller returns 409 with a useful message.
+    6. Add an integration test that creates parent + child, calls the delete path, asserts the child is gone (or 409 returned, with no partial mutation).
+    7. For external-service references, add (or confirm existence of) the periodic reconciliation job.
+
+    **Why:** orphaned rows are a slow-burning data-quality fire. They compound over time, distort analytics, break foreign-key-aware ORMs, and eventually surface as "the dashboard shows wrong totals" or "deleted user's tracks still appear in shared views". Cascade discipline at write time is 10× cheaper than data-cleanup migrations later. Pen-testers also probe for orphan-shaped IDOR (insecure direct object reference) bugs — a stale row pointing at a deleted user is a classic privilege-escalation vector.
 
 ## Mandatory reading order
 
