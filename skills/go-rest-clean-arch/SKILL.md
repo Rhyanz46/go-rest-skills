@@ -1,0 +1,85 @@
+---
+name: go-rest-clean-arch
+description: Playbook for Go REST backends that follow the Clean Architecture pattern (controller → use_case → repository), map_validator-based request validation, and the strict Stop-and-Wait learning order from ai_instruction/. Use this skill whenever the user asks to design, scaffold, extend, or refactor a Go service in this style — typical signals are mentions of "clean architecture", "controller / use_case / repository / filter pattern", `map_validator`, this project's `app/` layout, or a request to bootstrap a new endpoint, layer, or feature in such a project.
+---
+
+# go-rest-clean-arch — Playbook for Go REST backends in Clean Architecture style
+
+This skill mirrors the `ai_instruction/` playbook from the planner-backend project. The full doctrine lives in `references/`; this file is the entry point that tells future Claude **what to read, in what order, and what hard rules to enforce**.
+
+## When this skill applies
+
+Trigger only when the user is working on a Go REST service that already follows — or wants to follow — the structure:
+
+```
+app/
+├── controller/<feature>/         # HTTP layer + map_validator rules
+├── use_case/<feature>/           # business logic
+└── repository/<feature>/         # GORM data access
+config/  database/  routes/  pkg/
+```
+
+Strong signals: filenames such as `controller.go`/`usecase.go`/`repository.go` per feature, a `routes/routes.go` wiring with `setupAuthenticatedRoutes`, presence of `map_validator.BuildRoles()` in `rules.go`, an `ai_instruction/` directory, or the user explicitly invoking this playbook.
+
+If the project is a generic Go module without these markers, **do not apply this skill** — ask the user first.
+
+## Hard rules (apply always)
+
+1. **Never skip the learning order.** Even if the user asks for APM or Swagger directly, verify Phase 1–2 are complete first; otherwise refuse and explain.
+2. **Stop-and-Wait at every layer checkpoint.** After finishing a layer, summarise what was produced and wait for explicit user confirmation before moving to the next layer. Do not chain layers silently.
+3. **Layer dependency direction is one-way.** Controller depends on use_case, use_case depends on repository. Never the other direction. No business logic in controllers, no HTTP types in use_case, no GORM types leaking out of repository.
+4. **Filter Pattern is mandatory** for every list/query operation in repositories — see `references/app_package.md`.
+5. **Validation lives in `rules.go` as package-level `var`** declared via `map_validator.BuildRoles()`, called from controllers with `map_validator.ValidateJSON[T]`. Do **not** use `c.ShouldBindJSON` or `binding:"..."` tags for validation in this style.
+6. **Swagger annotations only on HTTP handler functions** in controllers — never on use_case, repository, or private helpers.
+7. **APM and structured logging** come last; require Phase 1–2 to be 99% complete (per `instruction_order.md`).
+8. **Defaults you can write without comments** still apply per the user's general code style; comments are allowed in this playbook only when they capture non-obvious WHY (constraints, invariants, surprising behaviour).
+
+## Mandatory reading order
+
+Read references in this exact sequence. Each line is a checkpoint — confirm understanding (or with the user, confirm completion of the implementation it describes) before moving to the next.
+
+| Phase | Read | When to read it |
+|------:|:----|:----|
+| 0 | `references/instruction_order.md` | Always first. Re-read the rules + checkpoints below before starting any non-trivial task in such a project. |
+| 1.1 | `references/project_architecture.md` | Before designing or touching any layer. Cements Clean Architecture principles, layer responsibilities, allowed dependencies. |
+| 1.2 | `references/app_package.md` | Before creating or modifying any file under `app/`. This is the longest doc — only read sections relevant to the task (controller, use_case, repository, filter pattern, errors, transforms). 99% adherence is required before Phase 2/3. |
+| 2.1 | `references/main_and_routes_guide.md` | Before touching `main.go`, `routes/`, or the wiring between layers. Covers dependency injection and route grouping. |
+| 2.2 | `references/MAP_VALIDATOR_GUIDE.md` | Before adding or changing any controller request struct or `rules.go`. Use the v0.0.41+ short-constructor idioms (`Str`, `Int`, `Email`, `UUID`, `StrEnum`, `IntEnum`, `NestedObject`, `ListOfObject`) and chain helpers (`.Nullable`, `.Default`, `.WithMin`, `.WithMax`, `.Between`, `.Regex`, `.WithMsg`, `.UniqueFrom`, `.WithRequiredIf`, `.WithRequiredWithout`). The 5-step pipeline is an escape hatch only. |
+| 3.1 (optional) | `references/swagger_annotation_guide.md` | Only after controllers + routes are working end-to-end. Annotate **HTTP handler functions only** — never use_case, repository, or private helpers. |
+| 3.2 (optional) | `references/apm_and_log_guide.md` | Only when Phase 1–2 are 99% complete and all business features are working. |
+
+If a user request requires content from a phase the project hasn't reached yet, refuse and explain — do not jump phases.
+
+## Stop-and-Wait checkpoint template
+
+Use this checkpoint pattern between layers. Confirm with the user before continuing:
+
+```
+Layer X selesai:
+- Yang dibuat: <files + key types/functions>
+- Hard rules dipatuhi: <bullet list>
+- Belum disentuh: <next layer>
+
+Lanjut ke layer berikutnya?
+```
+
+## Workflow patterns (cheat sheet)
+
+### Adding a new feature end-to-end
+1. Confirm Phase 1 (architecture + app_package) is already 99% in this codebase. If not, surface gaps first.
+2. Layer order: **repository → use_case → controller → routes**. Stop-and-Wait between each.
+3. For every layer, re-read the matching reference section before writing code.
+4. Validation rules go in `controller/<feature>/rules.go`; request structs go in `controller/<feature>/models.go` without `binding` tags.
+5. Wire into `routes/routes.go` last; add Swagger annotations only after the route works.
+
+### Bug fix in an existing layer
+1. Read only the reference for the layer you're touching plus `project_architecture.md`.
+2. Apply the change without leaking concerns into adjacent layers.
+3. Skip Stop-and-Wait if the change is a single-layer single-file fix; still announce what changed.
+
+### When the user requests APM or Swagger up-front
+- Verify Phase 1–2 completion. If incomplete, refuse with the checklist from `references/instruction_order.md` (Rule #3 / Rule #4) and offer to complete the prerequisite layers first.
+
+## Pointers, not paraphrases
+
+For every concrete pattern (filter struct shape, repository signatures, error mapper, validator rule examples, span/log fields, Swagger comment template), **read the reference file** rather than relying on memory. The references are the source of truth and may evolve; this SKILL.md only captures the orchestration rules.

@@ -1,0 +1,9 @@
+{
+  "name": "rhyanz46",
+  "version": "0.1.0",
+  "description": "Playbook for Go REST backends built on Clean Architecture (controller → use_case → repository), map_validator request validation, and the Stop-and-Wait learning order from ai_instruction/.",
+  "author": {
+    "name": "rhyanz46",
+    "email": "rianariansaputra@gmail.com"
+  }
+}
