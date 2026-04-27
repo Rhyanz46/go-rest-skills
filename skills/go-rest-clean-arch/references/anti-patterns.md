@@ -683,6 +683,213 @@ Now `grep request_id=abc-123` returns every log line for the failing request: mi
 
 ---
 
+## L. Silently ignored errors (rule #19)
+
+### ❌ Salah — discarding the error with `_`
+
+```go
+result, _ := r.repo.GetOne(ctx, filter)
+return result, http.StatusOK, nil
+
+// later, when the DB is down:
+//   result == zero value, statusCode == 200, no log line, no alert.
+//   Frontend renders empty data. Users tweet at you.
+```
+
+The 200 OK is a lie. The repo could not load anything; the use_case said "all good". Errors that aren't checked aren't errors — they're silent landmines.
+
+### ❌ Salah — fire-and-forget goroutine that swallows the error
+
+```go
+go func() {
+    _ = r.notifyExternalService(ctx, payload)
+}()
+```
+
+If the external service is down for an hour, you have **zero** evidence in the logs. Eventually a customer notices and you find out via a support ticket.
+
+### ✅ Benar — check, propagate, or justify with a comment
+
+```go
+result, code, err := r.repo.GetOne(ctx, filter)
+if err != nil {
+    return nil, code, common.RepositoryErrorToDomain(code, err)
+}
+return result, http.StatusOK, nil
+```
+
+Or, when ignoring is genuinely correct, a one-line comment names the reason:
+
+```go
+defer func() {
+    _ = rows.Close()  // ignored: best-effort cleanup; primary error already returned
+}()
+
+_ = json.Marshal(staticConfig)  // ignored: marshal of known-good static value cannot fail in this context
+```
+
+For goroutines, surface the error explicitly:
+
+```go
+go func() {
+    if err := r.notifyExternalService(ctx, payload); err != nil {
+        log.Printf("[notify] request_id=%s err=%v",
+            common_utils.RequestIDFrom(ctx), err)
+    }
+}()
+```
+
+If the side-effect is truly fire-and-forget (idempotent retry, low-stakes hint), document it with a comment. No comment + ignored goroutine error = a violation.
+
+### ❌ Salah — single-value type assertion
+
+```go
+userIDStr := userID.(string)         // panics on type mismatch
+ownerID := uuid.Parse(userIDStr).(uuid.UUID)
+```
+
+A handful of these will eventually panic in production on a malformed JWT.
+
+### ✅ Benar — two-value type assertion + check
+
+```go
+userIDStr, ok := userID.(string)
+if !ok {
+    common.SendError(c, http.StatusInternalServerError, errors.New("user_id in context is not a string"))
+    return
+}
+```
+
+### Enforcement
+
+- `errcheck ./...` (or `golangci-lint run --enable=errcheck`) flags every unchecked error return at compile time.
+- `tools/lint.sh` catches the loudest smells (e.g. `_ = json.Marshal(`) but `errcheck` is exhaustive — wire both.
+
+---
+
+## M. Resource leaks and dangling goroutines (rule #20)
+
+### ❌ Salah — `context.WithTimeout` without `defer cancel()`
+
+```go
+ctx, _ := context.WithTimeout(parentCtx, 5*time.Second)
+result, err := r.client.Do(ctx, req)
+// cancel was never called → goroutine inside WithTimeout leaks for 5s after each call
+```
+
+Under load this is fine for a while, then the runtime hits its goroutine cap and everything stalls.
+
+### ✅ Benar
+
+```go
+ctx, cancel := context.WithTimeout(parentCtx, 5*time.Second)
+defer cancel()
+result, err := r.client.Do(ctx, req)
+```
+
+`go vet` (`lostcancel`) catches this statically — wire it into CI.
+
+### ❌ Salah — `http.Response.Body` not closed
+
+```go
+resp, err := http.Get(url)
+if err != nil { return err }
+data, err := io.ReadAll(resp.Body)
+return data, err
+// resp.Body never closed → connection stays in pool, eventually exhausts the client
+```
+
+### ✅ Benar — `defer Close` immediately after the err check
+
+```go
+resp, err := http.Get(url)
+if err != nil { return nil, err }
+defer resp.Body.Close()                          // ← closes on every return path
+data, err := io.ReadAll(resp.Body)
+return data, err
+```
+
+Bonus — drain before close to keep the connection reusable: `io.Copy(io.Discard, resp.Body)` before the `Close`. `bodyclose` linter catches the missing close.
+
+### ❌ Salah — long-running goroutine with no termination contract
+
+```go
+func InitKeyRotator(svc *Svc) {
+    go func() {
+        for {
+            svc.refreshKey()
+            time.Sleep(1 * time.Hour)
+        }
+    }()
+}
+```
+
+The goroutine outlives the server's graceful shutdown. On `SIGTERM`, the process kills it mid-`refreshKey()` (data corruption risk). Worse: if the function is called twice (in tests, in hot reload), you accumulate goroutines forever.
+
+### ✅ Benar — context-driven lifecycle
+
+```go
+func InitKeyRotator(ctx context.Context, svc *Svc) {
+    go func() {
+        ticker := time.NewTicker(1 * time.Hour)
+        defer ticker.Stop()
+        for {
+            select {
+            case <-ctx.Done():
+                return
+            case <-ticker.C:
+                if err := svc.refreshKey(); err != nil {
+                    log.Printf("[key-rotator] err=%v", err)
+                }
+            }
+        }
+    }()
+}
+
+// in main.go:
+ctx, cancel := context.WithCancel(context.Background())
+defer cancel()
+InitKeyRotator(ctx, svc)
+// on SIGTERM: cancel() → goroutine exits cleanly, ticker stops.
+```
+
+### ❌ Salah — DB transaction without rollback safety net
+
+```go
+tx := db.Begin()
+if err := tx.Create(&a).Error; err != nil {
+    return err  // ← transaction left dangling; locks held until DB times it out
+}
+return tx.Commit().Error
+```
+
+### ✅ Benar — defer rollback as the safety net; commit is the explicit happy path
+
+```go
+tx := db.Begin()
+defer func() {
+    if r := recover(); r != nil { tx.Rollback(); panic(r) }
+}()
+if err := tx.Create(&a).Error; err != nil {
+    tx.Rollback()
+    return err
+}
+return tx.Commit().Error  // rollback after successful commit is a no-op in most drivers
+```
+
+### Enforcement
+
+- `go vet ./...` for `lostcancel`.
+- `golangci-lint run --enable=bodyclose,sqlclosecheck,rowserrcheck` for HTTP body / SQL row leaks.
+- `go.uber.org/goleak.VerifyNone(t)` at the end of integration tests asserts no goroutines leaked.
+
+If you spawn a goroutine in this codebase, it must satisfy at least one of:
+1. Has a `context.Context` parameter and exits on `<-ctx.Done()`.
+2. Completes within bounded time (no `for { ... }` loop without exit) and is `go`-ed from a request handler.
+3. Has a comment explaining why it's lifetime-coupled to the process and tested for leakage.
+
+---
+
 ## Summary — when in doubt
 
 | Smell | Probably violates | Read |
@@ -704,3 +911,7 @@ Now `grep request_id=abc-123` returns every log line for the failing request: mi
 | `json:"camelCase"` / `form:"snake_case"` / underscore in URL path | REST surface naming (#17) | Section J |
 | `c.JSON(...err.Error()...)` or `gin.H{"error": ...}` from controller | 5xx sanitization (#18) | Section K |
 | use_case `log.Printf` without `RequestIDFrom(ctx)` | request_id propagation (#18) | Section K |
+| `_, _ := f()` / `go f()` swallowing an error | Never ignore errors (#19) | Section L |
+| Single-value type assertion `i.(T)` outside test code | Never ignore errors (#19) | Section L |
+| `context.WithTimeout/Cancel/Deadline` without `defer cancel()` | Resource cleanup (#20) | Section M |
+| `http.Response.Body` not closed; goroutine without context exit | Resource cleanup (#20) | Section M |

@@ -115,6 +115,36 @@ The rules are grouped to make scanning easier; the numbering is global so you ca
     Logs from below the controller (use_case, repository) that want to participate in incident triage must include `RequestIDFrom(ctx)` in their log line — same key, so `grep request_id=abc-123` returns every line for the offending request.
 
     **Why this rule:** during an incident, the only thing the user can copy out of the browser is the `request_id`. Without it, you grep logs by timestamp and pray. With it, one `grep` returns the full request lifecycle: middleware → controller → use_case → repo → DB error. The rule pays for itself the first time production breaks.
+19. **Never ignore errors. Every `error` return is checked, propagated, or justified.**
+    - **Forbidden by default:** `result, _ := f()`, `_ = f()`, `go f()` where `f` returns `error`.
+    - **Allowed only with an inline `// ignored: <reason>` comment** that names the specific reason — e.g. `_ = json.Marshal(v)  // ignored: marshal of known-good value cannot fail` or `_ = rows.Close()  // ignored: best-effort cleanup, primary error already returned`. The comment is the audit trail.
+    - **Goroutines must surface errors.** Either:
+      - The goroutine writes the error to a channel that the caller drains, or
+      - The goroutine logs the error itself (with `request_id` from context per rule #18), or
+      - The goroutine is documented as "fire-and-forget for an idempotent side-effect; failure is acceptable" with a comment.
+      
+      Never `go f()` and discard a non-nil error silently.
+    - **Type assertions** must use the two-value form (`v, ok := i.(T)`) and check `ok`. Single-value `i.(T)` panics on mismatch and is forbidden outside test code.
+    - **Enforce in CI** with `errcheck` (or `golangci-lint run --enable=errcheck`). Add it to the project's lint pipeline alongside `tools/lint.sh`. The skill's lint script flags the most common smells (`, _ :=` from common error-returning APIs) but `errcheck` is the comprehensive backstop.
+
+    **Why:** silent error swallowing is the single largest source of "the app behaves weird in production but everything looks fine in dev". A discarded error today is a 3 AM incident next quarter.
+20. **No memory leaks, no dangling resources, no orphaned goroutines.** Every acquired resource has a paired release on every code path:
+    - **`context.WithCancel` / `WithTimeout` / `WithDeadline`** → `defer cancel()` immediately. `govet -lostcancel` catches the static cases; review covers the rest.
+    - **`http.Response.Body`** → `defer resp.Body.Close()` immediately after the `if err != nil` check (the Body is non-nil even on some non-2xx responses). Drain it (`io.Copy(io.Discard, resp.Body)`) before close if you want connection reuse.
+    - **`os.File`, `*sql.Rows`, `*os.Stdin` substitutes** → `defer f.Close()`. GORM usually manages rows, but raw `db.Raw(...).Rows()` calls are your responsibility.
+    - **`time.NewTicker` / `time.NewTimer`** → `defer ticker.Stop()`. Especially long-lived tickers spawned from goroutines.
+    - **Long-running goroutines** must accept a `context.Context` (or a `done <-chan struct{}`) and exit when it's cancelled. The pattern: spawn at startup with the app's root context, cancel on `SIGTERM`. Never spawn a goroutine that has no termination contract — it will outlive the request, the user, and eventually the server.
+    - **Channels** that are sent to in a loop must have a documented close discipline. Forgotten close → leaked receivers blocked forever.
+    - **Repositories that open transactions** (`db.Begin()`) must `defer tx.Rollback()` and explicitly `tx.Commit()` on the happy path; the rollback is a no-op after a successful commit.
+
+    **Tools:**
+    - `go vet ./...` (covers `lostcancel` plus several leak smells) — run in CI.
+    - `golangci-lint run --enable=govet,errcheck,bodyclose,sqlclosecheck,rowserrcheck` for comprehensive coverage.
+    - `go.uber.org/goleak` in tests — assert no goroutines leaked from a test (great for repository/use_case tests that spawn workers).
+
+    The skill's `tools/lint.sh` carries a few shell-level smells (e.g. `context.WithCancel` with no nearby `defer cancel`), but Go's static analysis tooling is the real backstop. Wire it into CI alongside `lint-arch`.
+
+    **Why:** a leaked goroutine silently consumes memory and DB connections until the pod OOM-kills. A leaked `resp.Body` exhausts the HTTP client's connection pool. Both bugs look fine in dev (tiny load, short uptime) and only surface under sustained traffic — i.e. exactly when you can't iterate fast.
 
 ## Mandatory reading order
 

@@ -184,6 +184,100 @@ m=$(scan 'log\.(Printf|Println|Print|Errorf|Warnf|Infof)\(' app/use_case app/rep
 filtered=$(printf '%s' "$m" | grep -v 'RequestIDFrom\|request_id=' || true)
 report_violation 18 "log line below the controller layer without request_id from context (advisory: include common_utils.RequestIDFrom(ctx))" "$filtered"
 
+# ---- Rule #19: never ignore errors ------------------------------------------
+
+# Discarding the error from common error-returning APIs without justification.
+# Skip _test.go files — error swallowing in tests is sometimes intentional.
+m=$(scan ',\s*_\s*:?=\s*(json\.(Marshal|Unmarshal)|os\.(Open|Create|ReadFile|WriteFile)|http\.(Get|Post|Do)|exec\.Command|tx\.(Commit|Rollback)|sql\.Open|db\.Exec|stmt\.Exec)' app)
+filtered=$(printf '%s' "$m" | grep -v '_test\.go:' || true)
+report_violation 19 "discarded error from a function that commonly returns one (use errcheck for full coverage)" "$filtered"
+
+# Single-value type assertion (forbidden outside _test.go).
+# Pattern: line whose LHS of := is a single identifier (no comma) followed by
+# `value.(Type)` form. Two-value `v, ok := x.(T)` has a comma in LHS — skip.
+m=$(scan '^\s*[A-Za-z_][A-Za-z0-9_]*\s*:=\s+[A-Za-z_][A-Za-z0-9_.]*\.\([A-Za-z_][A-Za-z0-9_.*\[\]]*\)\s*$' app)
+filtered=$(printf '%s' "$m" | grep -v '_test\.go:' || true)
+report_violation 19 "single-value type assertion (use two-value form: v, ok := i.(T))" "$filtered"
+
+# Goroutine swallowing error: `go func() { _ = f(...) }()` heuristic
+if have_rg; then
+    m=$(rg --multiline --multiline-dotall -n --no-heading \
+        'go\s+func\([^)]*\)\s*\{[^}]{0,200}_\s*=\s*\w' \
+        app 2>/dev/null || true)
+    report_violation 19 "goroutine likely swallows error (assign to _ instead of logging it)" "$m"
+fi
+
+# ---- Rule #20: resource cleanup ---------------------------------------------
+
+# context.WithCancel/WithTimeout/WithDeadline without `defer cancel()` nearby.
+# Heuristic: scan for the assignment, then check if `defer cancel()` appears
+# within the next 5 lines of the same file. False positives possible — review.
+if have_rg; then
+    matches=$(rg -n --no-heading 'context\.(WithCancel|WithTimeout|WithDeadline)\(' app 2>/dev/null || true)
+    leak_lines=""
+    while IFS= read -r line; do
+        [[ -z "$line" ]] && continue
+        file="${line%%:*}"
+        rest="${line#*:}"
+        lineno="${rest%%:*}"
+        end=$((lineno + 8))
+        if [[ -f "$file" ]]; then
+            # Accept either `defer cancel()` OR a bare `cancel()` call within the window.
+            if ! sed -n "${lineno},${end}p" "$file" 2>/dev/null | grep -qE 'defer\s+cancel\(\)|^\s*cancel\(\)'; then
+                leak_lines+="${line}"$'\n'
+            fi
+        fi
+    done <<< "$matches"
+    leak_lines="${leak_lines%$'\n'}"
+    report_violation 20 "context.WithCancel/WithTimeout/WithDeadline without 'defer cancel()' or explicit cancel() nearby" "$leak_lines"
+fi
+
+# http.Get / http.Post / client.Do calls — ensure response.Body.Close is
+# deferred nearby. http.NewRequest is excluded — it builds a request and never
+# returns a body to close.
+if have_rg; then
+    matches=$(rg -n --no-heading '(http\.Get\(|http\.Post\(|\.Do\(req|httpClient\.Do\()' app pkg 2>/dev/null || true)
+    leak_lines=""
+    while IFS= read -r line; do
+        [[ -z "$line" ]] && continue
+        file="${line%%:*}"
+        rest="${line#*:}"
+        lineno="${rest%%:*}"
+        end=$((lineno + 8))
+        if [[ -f "$file" ]]; then
+            if ! sed -n "${lineno},${end}p" "$file" 2>/dev/null | grep -q 'defer.*\.Body\.Close'; then
+                leak_lines+="${line}"$'\n'
+            fi
+        fi
+    done <<< "$matches"
+    leak_lines="${leak_lines%$'\n'}"
+    report_violation 20 "HTTP request without nearby 'defer resp.Body.Close()'" "$leak_lines"
+fi
+
+# Bare `go func()` without a context parameter — heuristic for leaked goroutines.
+m=$(scan 'go\s+func\(\s*\)' app pkg)
+report_violation 20 "goroutine spawned without a context parameter (verify it has a termination contract)" "$m"
+
+# time.NewTicker without nearby Stop() — heuristic
+if have_rg; then
+    matches=$(rg -n --no-heading 'time\.NewTicker\(' app pkg 2>/dev/null || true)
+    leak_lines=""
+    while IFS= read -r line; do
+        [[ -z "$line" ]] && continue
+        file="${line%%:*}"
+        rest="${line#*:}"
+        lineno="${rest%%:*}"
+        end=$((lineno + 6))
+        if [[ -f "$file" ]]; then
+            if ! sed -n "${lineno},${end}p" "$file" 2>/dev/null | grep -q '\.Stop()'; then
+                leak_lines+="${line}"$'\n'
+            fi
+        fi
+    done <<< "$matches"
+    leak_lines="${leak_lines%$'\n'}"
+    report_violation 20 "time.NewTicker without nearby 'defer ticker.Stop()'" "$leak_lines"
+fi
+
 # ---- Rule #13: output timestamps stay UTC -----------------------------------
 
 # Detect .In(<loc>) inside transform.go files (heuristic — the function name "transform" is the smell)
