@@ -86,6 +86,7 @@ Read references in this exact sequence. Each line is a checkpoint — confirm un
 | 3.2 (optional) | `references/apm_and_log_guide.md` | Only when Phase 1–2 are 99% complete and all business features are working. |
 | Sidebar | `references/anti-patterns.md` | Whenever you're about to write or review a loop with a repo call, a transform between layers, a filter struct, a placeholder function, or a timezone-dependent calculation. Concrete "salah vs benar" examples for every hard rule. |
 | Recipe | `references/feature-recipe.md` | Whenever you're adding a new feature end-to-end. Concrete walkthrough: file layout per layer, schema + AutoMigrate, central wiring (`repositories.go` / `use_cases.go` / `controllers.go`), routes setup, ownership filter from controller, computed filter translation in use_case, datetime validation note. Use the `reminders` example as template. |
+| Bootstrap | `references/bootstrap-new-project.md` | Whenever the user starts a brand-new Go REST project that should adopt this playbook from day one. Covers `go mod init`, dependency list, directory skeleton, the four shared utility packages (`pkg/paginate_utils/`, `app/*/common/`), database bootstrap, empty central wiring, `CLAUDE.md` pointer, and lint integration. End state: a project that compiles with zero features but is ready for the first one. |
 
 If a user request requires content from a phase the project hasn't reached yet, refuse and explain — do not jump phases.
 
@@ -118,6 +119,29 @@ Lanjut ke layer berikutnya?
 
 ### When the user requests APM or Swagger up-front
 - Verify Phase 1–2 completion. If incomplete, refuse with the checklist from `references/instruction_order.md` (Rule #3 / Rule #4) and offer to complete the prerequisite layers first.
+
+## Lint contracts (automated rule enforcement)
+
+Every static-auditable hard rule has a matching shell-script check in `tools/lint.sh` at the plugin repo root. Drop it into a project's CI to catch violations automatically — humans don't have to remember to grep. The script flags:
+
+- Forbidden imports per layer (rule #4): GORM/schemas/gin in the wrong package.
+- GORM tags outside repository/schemas (rule #6).
+- `*gin.Context` / `GetAuthClaim` outside controllers (rule #7).
+- Repo methods named `GetByX`/`FindByX` (rule #8).
+- `c.ShouldBindJSON` or `binding:` tags in controllers (rule #9).
+- `time.LoadLocation` outside `app/use_case/common/timezone.go` (rule #10).
+- Hand-rolled pagination math, raw `gin.H` responses (rule #10).
+- Use_case loops with repo method calls inside (rule #11, heuristic).
+- Placeholder/TODO no-op comments (rule #12, heuristic).
+- `time.Time.In(loc)` inside transform.go (rule #13, output-UTC).
+
+Wire it via Makefile + CI — see `references/bootstrap-new-project.md` Step 10 for the canonical setup. Existing projects can run it ad-hoc:
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/Rhyanz46/go-rest-skills/main/tools/lint.sh)
+```
+
+Violations exit non-zero with file:line citations grouped by rule. Heuristic checks (rules #11, #12) may have false positives — verify before refactoring.
 
 ## Pointers, not paraphrases
 

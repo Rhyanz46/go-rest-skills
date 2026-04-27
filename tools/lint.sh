@@ -1,0 +1,147 @@
+#!/usr/bin/env bash
+# go-rest-clean-arch architectural lint
+# Scans the current directory tree for violations of the static-auditable
+# hard rules from the go-rest-clean-arch skill.
+#
+# Usage:
+#   bash <(curl -fsSL https://raw.githubusercontent.com/Rhyanz46/go-rest-skills/main/tools/lint.sh)
+#
+# Or vendor it:
+#   curl -fsSL https://raw.githubusercontent.com/Rhyanz46/go-rest-skills/v0.2.0/tools/lint.sh -o scripts/lint-arch.sh
+#   chmod +x scripts/lint-arch.sh
+#   ./scripts/lint-arch.sh
+#
+# Exit code 0 = clean, non-zero = violations found.
+# Each rule that fails prints its number and the offending file:line.
+
+set -u
+shopt -s globstar nullglob 2>/dev/null || true
+
+# ---- helpers ----------------------------------------------------------------
+
+violations=0
+
+# Use ripgrep when available (faster, ignores .gitignore by default), fall back to git grep.
+have_rg() { command -v rg >/dev/null 2>&1; }
+
+scan() {
+    # scan <pattern> <path-or-glob...>
+    local pattern="$1"; shift
+    if have_rg; then
+        rg -n --no-heading --color=never "$pattern" "$@" 2>/dev/null || true
+    else
+        # git grep falls back to all tracked files under the given paths
+        git grep -n -E "$pattern" -- "$@" 2>/dev/null || true
+    fi
+}
+
+report_violation() {
+    local rule="$1" headline="$2" matches="$3"
+    if [[ -n "$matches" ]]; then
+        violations=$((violations + 1))
+        printf '\n[Rule #%s] %s\n' "$rule" "$headline"
+        printf '%s\n' "$matches" | sed 's/^/  /'
+    fi
+}
+
+# ---- preconditions ----------------------------------------------------------
+
+if [[ ! -d app ]]; then
+    echo "skipped: no app/ directory at $(pwd) — this lint targets go-rest-clean-arch projects" >&2
+    exit 0
+fi
+
+echo "go-rest-clean-arch lint — scanning $(pwd)"
+echo "----------------------------------------"
+
+# ---- Rule #4: layer dependency direction ------------------------------------
+
+# Use case must NOT import GORM, schemas, or gin
+m=$(scan '^[[:space:]]*"(gorm\.io/gorm|gin-gonic/gin)"|"[^"]*/database/schemas"' app/use_case)
+report_violation 4 "use_case imports forbidden package (gorm, gin, or database/schemas)" "$m"
+
+# Controller must NOT import GORM or schemas (gin is allowed and expected)
+m=$(scan '^[[:space:]]*"gorm\.io/gorm"|"[^"]*/database/schemas"' app/controller)
+report_violation 4 "controller imports forbidden package (gorm or database/schemas)" "$m"
+
+# Repository must NOT import gin
+m=$(scan '^[[:space:]]*"github\.com/gin-gonic/gin"' app/repository)
+report_violation 4 "repository imports forbidden package (gin)" "$m"
+
+# ---- Rule #6: three model sets — no GORM tags outside repo/schemas ----------
+
+m=$(scan 'gorm:"' app/use_case app/controller)
+report_violation 6 "GORM struct tags found outside repository/schemas layer" "$m"
+
+# ---- Rule #7: GetAuthClaim only in controller -------------------------------
+
+m=$(scan 'GetAuthClaim|GetUserIDFromContext|c\.Get\("user_id"\)|\*gin\.Context' app/use_case app/repository)
+report_violation 7 "auth-context handle (gin.Context / GetAuthClaim) used outside controller" "$m"
+
+# ---- Rule #9: validation in rules.go, not binding tags / ShouldBindJSON ----
+
+# Find binding: tags inside the controller layer (allowed in path-param uri tags? no — push them to rules.go too)
+m=$(scan 'binding:"' app/controller)
+report_violation 9 "controller still uses binding: tag (legacy validation)" "$m"
+
+# ShouldBindJSON inside controllers (binding query params via ShouldBindQuery is fine here — only JSON-body case is the smell)
+m=$(scan 'ShouldBindJSON' app/controller)
+report_violation 9 "controller uses c.ShouldBindJSON (use map_validator.ValidateJSON[T] instead)" "$m"
+
+# ---- Rule #10: time.LoadLocation only inside common/timezone.go -------------
+
+# Find any time.LoadLocation call under app/ that is NOT in common/timezone.go
+all=$(scan '\btime\.LoadLocation\b' app)
+filtered=$(printf '%s' "$all" | grep -v 'app/use_case/common/timezone\.go' || true)
+report_violation 10 "time.LoadLocation called directly (use common.LoadLocationOrDefault)" "$filtered"
+
+# Hand-rolled pagination math under app/
+m=$(scan '\(\s*[A-Za-z_][A-Za-z0-9_]*\s*-\s*1\s*\)\s*\*\s*[A-Za-z_][A-Za-z0-9_]*' app)
+report_violation 10 "hand-rolled pagination offset math (use pkg/paginate_utils)" "$m"
+
+# Direct gin.H responses in controllers (use common.SendSuccess/SendError)
+m=$(scan 'c\.JSON\([^,]+,\s*gin\.H\{' app/controller)
+report_violation 10 "raw gin.H response shape in controller (use common.SendSuccess/SendError)" "$m"
+
+# ---- Rule #11: N+1 in use_case loops (heuristic) ----------------------------
+
+# Find functions in use_case that loop and call a repo method by the typical r.<repo>. or .repo. shape.
+# This is a heuristic — false positives possible. We report and let humans triage.
+if have_rg; then
+    n1=$(rg --multiline --multiline-dotall -n --no-heading \
+        'for\s+_?,?\s*\w+\s*:?=\s*range[^{]+\{[^}]{0,400}r\.\w*[Rr]epo\.\w+\(' \
+        app/use_case 2>/dev/null || true)
+else
+    n1=""
+fi
+report_violation 11 "loop in use_case with repo method call inside (likely N+1; verify and refactor to batch fetch)" "$n1"
+
+# ---- Rule #12: placeholder no-op heuristics ---------------------------------
+
+# Function bodies that are literally `// ... \n return nil` or `return X, nil` after a TODO/placeholder comment.
+m=$(scan '//\s*(For now|TODO|placeholder|Implementation would go here|In production this should)' app)
+report_violation 12 "placeholder/TODO comment likely guarding a no-op (verify the function actually implements its contract)" "$m"
+
+# ---- Rule #8: Filter Pattern — flag GetByX / FindByX repository methods ----
+
+m=$(scan 'func\s+\(\w+\s+\*?\w+Repository\w*\)\s+(GetBy|FindBy|ListBy)\w+' app/repository)
+report_violation 8 "repository method named GetBy/FindBy/ListBy<X> (use Filter struct on GetOne/List instead)" "$m"
+
+# ---- Rule #13: output timestamps stay UTC -----------------------------------
+
+# Detect .In(<loc>) inside transform.go files (heuristic — the function name "transform" is the smell)
+m=$(scan '\.In\(' app/use_case/**/transform.go 2>/dev/null || scan '\.In\(' app/use_case)
+filtered=$(printf '%s' "$m" | grep '/transform\.go:' || true)
+report_violation 13 "time.Time.In(loc) called inside a transform — output should stay UTC, only filter inputs convert" "$filtered"
+
+# ---- summary ----------------------------------------------------------------
+
+echo
+if [[ "$violations" -eq 0 ]]; then
+    echo "✅ go-rest-clean-arch lint: all clean"
+    exit 0
+else
+    echo "❌ go-rest-clean-arch lint: $violations rule(s) flagged"
+    echo "   Fix the issues above or add a justification comment in your PR."
+    exit 1
+fi
