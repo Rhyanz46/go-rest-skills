@@ -2,6 +2,10 @@
 
 Semua perubahan signifikan untuk plugin ini dicatat di sini. Versi mengikuti format `MAJOR.MINOR.PATCH`.
 
+## v0.10.4
+
+- **Fix**: hapus `"strict": false` di `marketplace.json` — itu yang menyebabkan error `conflicting manifests: both plugin.json and marketplace entry specify components` di `/doctor`. Default `strict: true` mengizinkan plugin.json (authority) + marketplace entry (supplements) coexist.
+
 ## v0.10.3
 
 - **Fix**: skill discovery — tambah `skills` array eksplisit di `marketplace.json` mengikuti format Anthropic reference. Tanpa ini, fresh install hasilnya `0 skills` di `/reload-plugins`. Reinstall plugin di mesin yang sudah pernah install untuk apply fix ini.

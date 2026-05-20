@@ -8,7 +8,6 @@
       "name": "rhyanz46",
       "source": "./",
       "description": "Collection of Claude Code skills: a Go REST Clean Architecture playbook and a general code-review skill that verifies unusual patterns with the responsible team before declaring them bugs.",
-      "strict": false,
       "skills": [
         "./skills/go-rest-clean-arch",
         "./skills/code-review-business"
