@@ -2,6 +2,10 @@
 
 Semua perubahan signifikan untuk plugin ini dicatat di sini. Versi mengikuti format `MAJOR.MINOR.PATCH`.
 
+## v0.10.3
+
+- **Fix**: skill discovery — tambah `skills` array eksplisit di `marketplace.json` mengikuti format Anthropic reference. Tanpa ini, fresh install hasilnya `0 skills` di `/reload-plugins`. Reinstall plugin di mesin yang sudah pernah install untuk apply fix ini.
+
 ## v0.10.2
 
 - **`code-review-business`**: tambah 4 contoh konkret (bug jelas, code smell, perlu konfirmasi bisnis × 2) + pattern-recognition guide untuk membedakan kategori.
