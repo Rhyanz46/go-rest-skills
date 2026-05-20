@@ -1,4 +1,4 @@
-# AI CDN Services - Project Architecture Documentation
+# Project Architecture Documentation
 
 ## 📋 Table of Contents
 

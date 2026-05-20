@@ -444,17 +444,17 @@ import (
     swaggerFiles "github.com/swaggo/files"
     ginSwagger "github.com/swaggo/gin-swagger"
 
-    _ "github.com/Lintasarta/ai-cdn-services/docs" // Import generated docs
+    _ "github.com/your-org/your-service/docs" // Import generated docs
 )
 
-// @title AI CDN Services API
+// @title Your Service API
 // @version 1.0
-// @description API documentation for AI CDN Services
-// @termsOfService https://lintasarta.com/terms
+// @description API documentation for your service
+// @termsOfService https://example.com/terms
 
 // @contact.name API Support
-// @contact.url https://lintasarta.com/support
-// @contact.email support@lintasarta.com
+// @contact.url https://example.com/support
+// @contact.email support@example.com
 
 // @license.name MIT
 // @license.url https://opensource.org/licenses/MIT
@@ -606,4 +606,4 @@ Required: Add complete swaggo annotations with @Summary, @Description, @Tags, @P
 - [Swaggo Documentation](https://github.com/swaggo/swag)
 - [OpenAPI Specification](https://swagger.io/specification/)
 - [Swagger UI Documentation](https://swagger.io/tools/swagger-ui/)
-- [Gin-Swagger Examples](https://github.com/swaggo/gin-swagger/tree/master/examples)
+- [Gin-Swagger Examples](https://github.com/swaggo/gin-swagger/tree/master/example)

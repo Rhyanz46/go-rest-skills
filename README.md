@@ -1,8 +1,6 @@
 # go-rest-skills
 
-Plugin marketplace untuk Claude Code CLI berisi kumpulan skill yang aku pakai sehari-hari. Plugin name di dalam marketplace ini adalah **`rhyanz46`**.
-
-Setelah plugin di-install, semua skill di dalamnya tersedia otomatis di sesi Claude Code, dengan namespace `rhyanz46:<skill-name>`.
+Plugin marketplace untuk Claude Code CLI berisi kumpulan skill untuk dipakai sehari-hari. Setelah plugin di-install, semua skill di dalamnya tersedia otomatis di sesi Claude Code.
 
 ---
 
@@ -15,7 +13,7 @@ Di dalam Claude Code CLI, jalankan:
 /plugin install rhyanz46@go-rest-skills
 ```
 
-Restart sesi setelah install. Cek dengan `/help` atau lihat daftar skill di system prompt — skill harus muncul dengan prefix `rhyanz46:`.
+Restart sesi setelah install. Cek dengan `/help` atau lihat daftar skill di system prompt — kedua skill harus muncul.
 
 Untuk update ke versi terbaru:
 
@@ -27,7 +25,7 @@ Untuk update ke versi terbaru:
 
 ## Skill yang tersedia
 
-### `rhyanz46:go-rest-clean-arch`
+### `go-rest-clean-arch`
 
 Playbook kanonik untuk Go REST backend dengan gaya **Clean Architecture** (controller → use_case → repository), validasi request berbasis `map_validator`, dan urutan belajar **Stop-and-Wait** dari `ai_instruction/`.
 
@@ -39,7 +37,7 @@ Pakai skill ini saat:
 
 Detail lengkap: [`skills/go-rest-clean-arch/SKILL.md`](skills/go-rest-clean-arch/SKILL.md) (+ folder `references/` untuk hard rules dan contoh).
 
-### `rhyanz46:code-review-business`
+### `code-review-business`
 
 Skill review kodingan general dengan satu prinsip kunci: **kalau ada yang aneh, verifikasi ke tim yang bersangkutan dulu — jangan langsung memvonis "bug"**. Banyak pola yang terlihat janggal sebenarnya sengaja begitu karena alasan bisnis, regulasi, atau kompromi historis.
 
@@ -53,6 +51,29 @@ Untuk PR formal, security review, atau perbaikan langsung, pakai built-in `/revi
 
 Detail lengkap: [`skills/code-review-business/README.md`](skills/code-review-business/README.md) dan [`SKILL.md`](skills/code-review-business/SKILL.md).
 
+#### Contoh output
+
+Misalkan kamu prompt: *"tolong review kodingan di `app/use_case/payment.go`"* — Claude akan menjawab kira-kira begini:
+
+> **🔴 Bug jelas (1)**
+>
+> - `payment.go:78` — error dari `repo.GetOrder()` di-ignore (`order, _ := ...`). Kalau order tidak ditemukan, fungsi lanjut pakai zero-value `Order` dan akan crash di `order.Customer.ID`. **Fix**: propagate error, jangan ignore.
+>
+> **🟡 Perlu konfirmasi bisnis (2)**
+>
+> 1. `payment.go:14` — refund di-branch berdasarkan tanggal hard-coded `2024-01-01`. Bisa jadi cutover dari migrasi sistem lama, atau requirement compliance.
+>     - **Tanya ke tim payments**: *"Tanggal `2024-01-01` di `Refund()` ini cutover apa? Apakah aman dijadikan konstanta bernama, atau memang akan ada cutover lain?"*
+>     - Owner kemungkinan: tim payments (dari `git log` 3 commit terakhir di file ini semua dari `@payment-team`)
+>
+> 2. `payment.go:92` — `customer.Tier == "legacy"` di-skip dari kalkulasi fee, padahal tier `"legacy"` tidak pernah di-write di codebase ini.
+>     - **Tanya ke tim billing**: *"Tier `legacy` masih dipakai? Di-set di mana? Skip fee di sini intended?"*
+>     - Owner belum jelas — disarankan tanya di `#engineering-general` dulu.
+>
+> **🟢 Code smell (1)**
+> - `payment.go:130-145` — chain `if-else` panjang untuk status enum. Layak refactor jadi `switch`. Prioritas rendah.
+
+Bagian 🟡 itu yang biasanya paling berharga — bukan menyuruh ubah, tapi menyiapkan pertanyaan + konteks supaya keputusan tetap di tim.
+
 ---
 
 ## Struktur repo
@@ -60,8 +81,8 @@ Detail lengkap: [`skills/code-review-business/README.md`](skills/code-review-bus
 ```
 .
 ├── .claude-plugin/
-│   ├── marketplace.json     # marketplace manifest (name: go-rest-skills)
-│   └── plugin.json          # plugin manifest (name: rhyanz46)
+│   ├── marketplace.json     # marketplace manifest
+│   └── plugin.json          # plugin manifest
 ├── skills/
 │   ├── go-rest-clean-arch/
 │   │   ├── SKILL.md
@@ -69,9 +90,12 @@ Detail lengkap: [`skills/code-review-business/README.md`](skills/code-review-bus
 │   └── code-review-business/
 │       ├── SKILL.md
 │       └── README.md
-└── tools/
-    └── lint.sh              # static analysis helper
+├── tools/
+│   └── lint.sh              # static analysis helper
+└── CHANGELOG.md             # version history
 ```
+
+Lihat [`CHANGELOG.md`](CHANGELOG.md) untuk riwayat perubahan tiap versi.
 
 ---
 

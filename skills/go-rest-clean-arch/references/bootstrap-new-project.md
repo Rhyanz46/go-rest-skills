@@ -50,6 +50,8 @@ Add `.gitignore`:
 
 ## Step 2 — Pull in the canonical dependencies
 
+> **⚠️ Verify before copy-paste**: Module paths upstream sometimes get renamed/moved. Before running these commands, sanity-check the path on [pkg.go.dev](https://pkg.go.dev/) — search the package and confirm the import path matches. If `go get` returns `module ... not found`, the path almost certainly changed upstream; do not bypass with `-insecure` or similar — fix the path.
+
 ```bash
 go get github.com/gin-gonic/gin
 go get gorm.io/gorm
@@ -57,7 +59,7 @@ go get gorm.io/driver/postgres
 go get gorm.io/driver/sqlite
 go get github.com/google/uuid
 go get github.com/joho/godotenv
-go get github.com/rhyanz46/map_validator
+go get github.com/Rhyanz46/go-map-validator/map_validator
 go get golang.org/x/sync/errgroup
 ```
 

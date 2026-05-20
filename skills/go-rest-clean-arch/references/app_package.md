@@ -3,7 +3,7 @@
 > **Note for AI Agents**: Replace `<PROJECT_NAME>` with your actual Go module name (e.g., `github.com/your-org/your-project`) and `<PROJECT_ROOT>` with your project's root directory path.
 >
 > **📝 Project Name Examples:**
-> - **GitHub:** `github.com/Lintasarta/ai-cdn-services`
+> - **GitHub:** `github.com/your-org/your-service`
 > - **GitLab:** `gitlab.com/company/project-name`
 > - **Internal:** `company.internal/product/service-name`
 > - **Local:** `my-project` (for local development only)

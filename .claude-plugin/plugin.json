@@ -1,7 +1,7 @@
 {
   "name": "rhyanz46",
-  "version": "0.1.0",
-  "description": "Playbook for Go REST backends built on Clean Architecture (controller → use_case → repository), map_validator request validation, and the Stop-and-Wait learning order from ai_instruction/.",
+  "version": "0.10.2",
+  "description": "Collection of Claude Code skills: Go REST Clean Architecture playbook (controller → use_case → repository, map_validator validation, Stop-and-Wait learning order) and a general code-review skill that verifies unusual patterns with the responsible team before declaring them bugs.",
   "author": {
     "name": "rhyanz46",
     "email": "rianariansaputra@gmail.com"

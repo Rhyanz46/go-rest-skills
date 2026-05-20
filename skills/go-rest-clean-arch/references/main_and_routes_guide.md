@@ -5,7 +5,7 @@
 > **⚠️ IMPORTANT**: Read `ai_instruction/instruction_order.md` for the mandatory learning sequence. This guide should be read AFTER completing `app_package.md`.
 >
 > **📝 Project Name Format**: Replace `<PROJECT_NAME>` with your actual Go module name:
-> - **GitHub:** `github.com/Lintasarta/ai-cdn-services`
+> - **GitHub:** `github.com/your-org/your-service`
 > - **GitLab:** `gitlab.com/company/project-name`
 > - **Internal:** `company.internal/product/service-name`
 > - **Local:** `my-project` (for local development only)
