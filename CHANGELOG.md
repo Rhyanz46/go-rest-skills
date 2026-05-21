@@ -2,6 +2,10 @@
 
 Semua perubahan signifikan untuk plugin ini dicatat di sini. Versi mengikuti format `MAJOR.MINOR.PATCH`.
 
+## v0.10.7
+
+- **Fix**: tambah block `metadata` (description + version) di marketplace-level dan `owner.email`. Diff terakhir vs Anthropic reference plugin yang berfungsi — mereka punya keduanya, kita tidak.
+
 ## v0.10.6
 
 - **Fix**: kembalikan `"strict": false` di `marketplace.json`. Setelah plugin.json dihapus di v0.10.5, default `strict: true` ternyata mengabaikan `skills` array di marketplace karena tidak ada plugin.json sebagai "authority". Anthropic reference plugin selalu pakai `strict: false` + `skills` array tanpa plugin.json — sekarang kita mirror persis.

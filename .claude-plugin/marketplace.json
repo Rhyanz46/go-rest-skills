@@ -1,7 +1,12 @@
 {
   "name": "go-rest-skills",
   "owner": {
-    "name": "rhyanz46"
+    "name": "rhyanz46",
+    "email": "rianariansaputra@gmail.com"
+  },
+  "metadata": {
+    "description": "Collection of Claude Code skills for Go REST backend development and general code review",
+    "version": "0.10.7"
   },
   "plugins": [
     {
