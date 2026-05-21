@@ -2,6 +2,10 @@
 
 Semua perubahan signifikan untuk plugin ini dicatat di sini. Versi mengikuti format `MAJOR.MINOR.PATCH`.
 
+## v0.10.6
+
+- **Fix**: kembalikan `"strict": false` di `marketplace.json`. Setelah plugin.json dihapus di v0.10.5, default `strict: true` ternyata mengabaikan `skills` array di marketplace karena tidak ada plugin.json sebagai "authority". Anthropic reference plugin selalu pakai `strict: false` + `skills` array tanpa plugin.json — sekarang kita mirror persis.
+
 ## v0.10.5
 
 - **Fix**: hapus `.claude-plugin/plugin.json`. Setelah `strict: false` dihapus di v0.10.4, plugin.json menjadi "authority" yang tidak mendeklarasikan skill apapun, sehingga `marketplace.json`'s `skills` array di-treat sebagai supplement dan tidak benar-benar di-load. Mirror layout Anthropic reference (`anthropic-agent-skills`) yang berfungsi: hanya `marketplace.json` dengan `skills` array. Versi sekarang otomatis di-track dari commit SHA.
