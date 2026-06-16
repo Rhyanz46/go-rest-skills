@@ -2,6 +2,10 @@
 
 Semua perubahan signifikan untuk plugin ini dicatat di sini. Versi mengikuti format `MAJOR.MINOR.PATCH`.
 
+## v0.11.0
+
+- **`go-rest-clean-arch`**: Hard rule #25 — search before you write, never re-implement a function/component yang sudah ada. Lebih luas dari rule #10 (yang cuma soal canonical reusables): melarang duplikasi *logic* apapun (helper, client, transform, const/enum) lintas feature. Pengecualian satu: rule #6 (duplikasi *data shape* antar-layer tetap disengaja). Wajib grep dulu sebelum menulis helper baru; promosikan ke `pkg/`/`common/` saat feature kedua membutuhkannya.
+
 ## v0.10.7
 
 - **Fix**: tambah block `metadata` (description + version) di marketplace-level dan `owner.email`. Diff terakhir vs Anthropic reference plugin yang berfungsi — mereka punya keduanya, kita tidak.

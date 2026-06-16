@@ -6,7 +6,7 @@
   },
   "metadata": {
     "description": "Collection of Claude Code skills for Go REST backend development and general code review",
-    "version": "0.10.7"
+    "version": "0.11.0"
   },
   "plugins": [
     {

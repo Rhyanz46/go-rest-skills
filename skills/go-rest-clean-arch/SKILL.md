@@ -363,6 +363,26 @@ The rules are grouped to make scanning easier; the numbering is global so you ca
     - The skill's lint script flags the most common narrowing-cast-on-pointer-deref shape (`uint16(*x)`, `int32(*x)`).
 
     **Why:** every silent narrowing is a stored data corruption waiting to detonate. The bug is invisible at write (no error, no panic), survives the test suite (you never test priority=-1 because "obviously you wouldn't"), and surfaces months later as "why is this DNS record served with priority 65535?". The validator-side constraint is one line in `rules.go` and it eliminates the entire class.
+25. **Search before you write — never re-implement a function or component that already exists.** Rule #10 bans duplicating the *canonical* cross-cutting helpers (pagination, error mapping, response envelope, timezone). This rule is broader: it bans duplicating **any** function, type, transform, client, or constant when an equivalent already lives in the repo. Two near-identical implementations are worse than one — they drift, fixes land in only one, and the next reader can't tell which is authoritative.
+
+    **Mandatory before authoring any new helper/function/type:**
+    - **Grep first.** Search the codebase for the behaviour you're about to write — by likely name (`grep -ri "func.*Paginate" app/ pkg/`), by the type it operates on, and by the string/constant it would hardcode. Do this *before* writing, not after.
+    - **If an equivalent exists, reuse or extend it.** Call the existing function; if it's close but not exact, add a parameter or a sibling method next to it — don't fork a parallel copy in your feature folder.
+    - **If it belongs to the shared layer, put it there.** A helper that two features need lives in `pkg/` or `app/*/common/`, not copy-pasted into each feature. The second feature to need it is the trigger to promote it.
+
+    **Concrete duplication smells this rule forbids:**
+    - The same date-parsing / formatting / TZ-loading snippet inlined in two use_cases instead of one `common/` helper (overlaps rule #10's timezone clause).
+    - A second `applyXFilters` / pagination / offset-math block when `pkg/paginate_utils/` already does it (rule #8 / #10).
+    - Two copies of an external-service client (account-service, media-service) constructed independently in different features instead of one shared client injected via DI.
+    - A transform helper (`transformXToY`) re-declared per controller when an identical one already exists for the same pair of types — extract it, don't paste it.
+    - Re-declaring a constant/enum value (status strings, header names, error messages) inline in N places instead of one `const` block. One source of truth; reference it.
+    - Re-deriving a value the framework or an existing helper already gives you (e.g. re-parsing `request_id` from the header instead of `RequestIDFrom(ctx)` — rule #18).
+
+    **The one exception is rule #6.** Do *not* "deduplicate" by sharing one struct or interface across two layers even if the fields look identical today — that's a layering violation, not DRY. Duplication of *data shapes across layers* is intentional; duplication of *logic* is the bug this rule targets. Transforms are the seam between them, and a transform that already exists for a given type pair must itself not be re-written (see the smell above).
+
+    **How to apply during review/edit:** when you catch yourself writing something that "feels familiar", stop and grep. When reviewing, if two blocks do the same thing, flag the newer one and point at the canonical implementation. Promote shared logic to `pkg/`/`common/` in the same pass rather than leaving a TODO.
+
+    **Why:** duplicated logic is a correctness time-bomb. A bug fixed in `parseFoo()` but not in its forgotten twin `parseFooV2()` ships a half-fix; a security check applied to one copy of a client and not the other is an open hole. Every duplicate doubles the maintenance surface and halves the odds a fix reaches all callers. The cost of one `grep` now is far less than a divergence hunt later.
 
 ## Mandatory reading order
 
