@@ -47,6 +47,8 @@ Pakai skill ini saat:
 
 Output dikelompokkan ke 4 kategori: **bug jelas**, **perlu konfirmasi bisnis** (paling penting — disertai pertanyaan siap-paste untuk tim terkait), **code smell**, dan **catatan positif**.
 
+Skill ini juga wajib mengecek **konsistensi perhitungan & logic lintas flow**: kalau besaran yang sama (total, pajak, diskon, kuota, transisi status) dihitung di lebih dari satu entry-point (mis. checkout vs admin manual vs import) dengan rumus berbeda, itu mismatch yang ditandai — bisa bug drift, bisa sengaja beda per-channel (perlu konfirmasi tim). Akar yang paling sering: **source of truth berbeda** — mis. fitur statistik/dashboard yang menghitung revenue dari tabel agregatnya sendiri, bukan dari data transaksi kanonik, sehingga angkanya selalu meleset.
+
 Untuk PR formal, security review, atau perbaikan langsung, pakai built-in `/review`, `/ultrareview`, atau `/security-review`.
 
 Detail lengkap: [`skills/code-review-business/README.md`](skills/code-review-business/README.md) dan [`SKILL.md`](skills/code-review-business/SKILL.md).

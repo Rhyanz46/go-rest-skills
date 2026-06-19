@@ -24,6 +24,31 @@ Saat melakukan review, untuk setiap temuan, klasifikasikan ke salah satu dari em
 
 Yang paling penting di skill ini adalah kategori ketiga.
 
+## Dimensi wajib: konsistensi perhitungan & flow lintas entry-point
+
+Selain menilai tiap potongan kode secara lokal, review **wajib** mengecek satu hal struktural: **apakah besaran bisnis yang sama (total, subtotal, fee, pajak, diskon, ongkir, kuota, poin, transisi status) dihitung / diputuskan secara konsisten di SEMUA flow yang mengaksesnya?**
+
+Satu entity sering disentuh lebih dari satu jalur. Contoh: `Order.Total` bisa dihitung di:
+- flow **checkout** customer (`use_case/checkout.go`),
+- flow **admin manual order** (`use_case/admin_order.go`),
+- flow **import batch / cron** (`use_case/order_import.go`),
+- flow **edit/recalculate** setelah order dibuat.
+
+Kalau rumus di jalur-jalur ini **berbeda** (urutan diskon vs pajak beda, satu pakai pembulatan satu tidak, satu skip ongkir, satu pakai harga snapshot satu pakai harga live), hasilnya **mismatch** — angka untuk order yang "sama" jadi beda tergantung dari mana ia dibuat. Ini salah satu bug paling mahal dan paling sering lolos review per-file, karena tiap file-nya sendiri terlihat benar.
+
+**Akar masalah yang paling sering: source of truth yang berbeda.** Mismatch biasanya terjadi bukan karena salah hitung, tapi karena dua flow/fitur mengambil angka dari **sumber data yang berbeda** untuk hal yang seharusnya satu sumber. Yang paling klasik adalah **fitur statistik/laporan/dashboard yang dibangun tim lain**: alih-alih meng-agregat dari record transaksi kanonik, fitur statistik menghitung ulang dari tabel/event/snapshot-nya sendiri yang tidak benar-benar sinkron dengan data transaksi asli — sehingga total revenue di dashboard tidak sama dengan penjumlahan transaksi yang sebenarnya. Saat review, tanyakan: **angka ini diturunkan dari source of truth yang mana? Apakah semua fitur yang menampilkan/menghitungnya menarik dari source yang sama?** Kalau fitur statistik punya jalur perhitungan terpisah yang tidak terikat ke data transaksi, itu mismatch yang harus ditandai — meskipun masing-masing fitur secara lokal terlihat benar.
+
+**Cara melakukan cek ini:**
+
+1. **Identifikasi besaran kunci** yang dihitung di kode yang direview (cari assignment ke field uang/kuota/status, atau fungsi `Calculate*`, `compute*`, `*Total`, `apply*Discount`, dll.).
+2. **Cari semua tempat besaran itu dihitung atau diset** — grep nama field / fungsi ke seluruh repo, jangan berhenti di satu file. Idealnya logic-nya dipanggil dari satu sumber bersama; kalau ternyata diduplikasi per-flow, itu sinyal.
+3. **Bandingkan**: apakah urutan operasi, rounding, threshold, input (harga snapshot vs live), dan kondisi skip-nya identik di semua jalur?
+4. **Klasifikasikan hasil divergence:**
+   - **Bug jelas** — kalau divergence jelas tidak disengaja (mis. satu flow lupa apply pajak, copy-paste yang satu sudah di-patch satu belum, rounding beda yang bikin selisih sen). Tidak ada alasan bisnis yang masuk akal → laporkan sebagai bug + tunjuk dua lokasi yang harus disamakan, sarankan extract ke satu fungsi shared.
+   - **Perlu konfirmasi bisnis** — kalau divergence **bisa jadi memang sengaja** (mis. admin boleh override harga, flow import pakai harga historis sesuai kontrak, channel B2B punya rumus pajak beda). Jangan langsung suruh samakan; tulis pertanyaan ke tim.
+
+Selalu sebut **kedua (atau semua) lokasi** yang mismatch dengan `file:line`, supaya bisa langsung dibandingkan.
+
 ## Format untuk temuan "perlu konfirmasi bisnis"
 
 Untuk setiap item kategori ini, output harus mengandung:
@@ -143,6 +168,66 @@ func CalculateShipping(order Order) float64 {
 
 ---
 
+### Contoh E — Mismatch perhitungan antar flow (bug drift)
+
+```go
+// use_case/checkout.go — flow customer
+func (s *CheckoutUC) calcTotal(o Order) int64 {
+    sub := o.Subtotal - o.Discount          // diskon dulu
+    tax := int64(math.Round(float64(sub) * 0.11))  // PPN dari subtotal SETELAH diskon
+    return sub + tax + o.Shipping
+}
+
+// use_case/admin_order.go — flow admin buat order manual
+func (s *AdminOrderUC) calcTotal(o Order) int64 {
+    tax := int64(float64(o.Subtotal) * 0.11) // PPN dari subtotal SEBELUM diskon, tanpa Round
+    return o.Subtotal + tax - o.Discount + o.Shipping
+}
+```
+
+**Klasifikasi**: divergence dua flow untuk besaran yang sama (`Order.Total`). Beda di **dua** hal: basis pajak (sebelum vs sesudah diskon) dan rounding (ada vs tidak). Order identik akan dapat total berbeda tergantung dibuat dari checkout atau dari admin.
+
+- Kalau tidak ada aturan pajak yang membenarkan dua basis berbeda → **bug jelas**: salah satu flow salah, kemungkinan copy-paste yang tidak ikut di-update.
+- Kalau ada kemungkinan basis pajak memang beda per channel (mis. order admin = B2B dengan skema pajak lain) → **perlu konfirmasi bisnis**.
+
+**Tindakan** (versi bug jelas):
+
+> **`use_case/checkout.go:3` vs `use_case/admin_order.go:3`** — `Order.Total` dihitung dua kali dengan rumus berbeda. Checkout: pajak dari subtotal **setelah** diskon + `math.Round`. Admin: pajak dari subtotal **sebelum** diskon, tanpa rounding. Order yang sama akan dapat total berbeda tergantung flow pembuatnya.
+>
+> **Fix**: satukan jadi satu fungsi (mis. `order.ComputeTotal()`) yang dipanggil kedua flow. Kalau ternyata basis pajak memang beda per channel, jangan disatukan dulu — **tanya ke tim finance/tax**: "Apakah order yang dibuat admin memang pakai basis pajak berbeda dari checkout customer, atau ini drift yang harus disamakan?"
+
+---
+
+### Contoh F — Source of truth berbeda (statistik tidak terikat data transaksi)
+
+```go
+// use_case/transaction.go — pembuatan transaksi (source of truth)
+func (s *TxUC) Create(t Transaction) error {
+    t.Net = t.Gross - t.Fee - t.Refund   // net actual per transaksi
+    return s.repo.Save(t)
+}
+
+// use_case/stats.go — fitur dashboard dibuat tim lain
+func (s *StatsUC) DailyRevenue(day time.Time) int64 {
+    rows := s.statsRepo.GetDailyAgg(day) // tabel agregat sendiri, diisi cron terpisah
+    var total int64
+    for _, r := range rows {
+        total += r.Gross * (1 - r.AvgFeeRate) // estimasi pakai rate rata-rata, bukan fee actual
+    }
+    return total
+}
+```
+
+**Klasifikasi**: mismatch source of truth. `transaction.go` adalah sumber kebenaran (net dihitung dari fee & refund **actual** per transaksi). `stats.go` tidak menarik dari situ — ia pakai tabel agregat sendiri dengan **estimasi** `AvgFeeRate` dan **mengabaikan refund**. Revenue di dashboard akan selalu meleset dari total transaksi sebenarnya, dan selisihnya membesar saat refund banyak.
+
+**Tindakan**:
+
+> **`use_case/stats.go:4` vs `use_case/transaction.go:3`** — `DailyRevenue` menghitung revenue dari tabel agregat sendiri (`GetDailyAgg`) pakai `AvgFeeRate` estimasi dan tanpa memperhitungkan refund, sementara source of truth revenue ada di `Transaction.Net` (fee & refund actual). Angka dashboard tidak akan match dengan penjumlahan transaksi asli.
+>
+> Kalau dashboard memang butuh angka exact → **bug**: agregasi harus diturunkan dari `Transaction.Net`, bukan jalur estimasi terpisah. Kalau estimasi sengaja dipakai demi performa (mis. dashboard real-time toleran selisih kecil) → **tanya ke tim data/finance**: "Dashboard revenue ini boleh pakai estimasi `AvgFeeRate` tanpa refund, atau harus exact sesuai `Transaction.Net`? Berapa toleransi selisih yang acceptable?"
+
+---
+
 ### Pattern recognition — kapan curiga "ada konteks bisnis"
 
 Kalau temuan mengandung salah satu dari berikut, **default-nya masuk kategori "perlu konfirmasi bisnis"**, bukan langsung jadi saran perbaikan:
@@ -153,6 +238,8 @@ Kalau temuan mengandung salah satu dari berikut, **default-nya masuk kategori "p
 - **Comment "TODO: remove after X"** yang sudah lewat tanggalnya — mungkin lupa, mungkin sengaja dipertahankan
 - **Field DB yang tidak pernah di-write di kode** — bisa jadi di-write oleh service lain / migration manual
 - **Hardcoded URL/endpoint** ke service spesifik — mungkin kontrak partnership
+- **Besaran yang sama dihitung/diset di lebih dari satu flow** (total, fee, pajak, diskon, kuota, transisi status) dengan rumus/urutan/rounding/threshold berbeda — mismatch lintas-flow (lihat Contoh E). Cross-check semua jalur sebelum memvonis; divergence bisa drift (bug) atau sengaja per-channel (konfirmasi bisnis).
+- **Fitur statistik/laporan/dashboard yang menghitung dari source data sendiri** (tabel agregat, event, snapshot) alih-alih dari record kanonik (mis. data transaksi) — source of truth berbeda, angka pasti drift (lihat Contoh F). Cek apakah agregasi terikat ke data asli atau jalur estimasi terpisah.
 
 Untuk hal-hal teknis murni (typo, error handling, race, leak, missing context propagation), tetap masuk kategori "bug jelas" — tidak perlu tanya tim.
 

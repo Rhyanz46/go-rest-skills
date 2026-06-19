@@ -2,6 +2,10 @@
 
 Semua perubahan signifikan untuk plugin ini dicatat di sini. Versi mengikuti format `MAJOR.MINOR.PATCH`.
 
+## v0.12.0
+
+- **`code-review-business`**: tambah dimensi review wajib — **konsistensi perhitungan & logic lintas flow**. Besaran bisnis yang sama (total, fee, pajak, diskon, kuota, transisi status) yang dihitung di lebih dari satu entry-point (checkout vs admin manual vs import) sering drift dan lolos review per-file karena tiap file-nya terlihat benar. Akar tersering: **source of truth berbeda** — mis. fitur statistik/dashboard yang meng-agregat dari tabel/event sendiri, bukan dari data transaksi kanonik, sehingga angkanya selalu meleset. Ditambah Contoh E (mismatch rumus total antar flow) & Contoh F (revenue dashboard tidak terikat data transaksi), plus dua sinyal pattern-recognition. Tetap ikut filosofi skill: divergence bisa bug drift (langsung fix) atau sengaja per-channel (konfirmasi tim dulu).
+
 ## v0.11.0
 
 - **`go-rest-clean-arch`**: Hard rule #25 — search before you write, never re-implement a function/component yang sudah ada. Lebih luas dari rule #10 (yang cuma soal canonical reusables): melarang duplikasi *logic* apapun (helper, client, transform, const/enum) lintas feature. Pengecualian satu: rule #6 (duplikasi *data shape* antar-layer tetap disengaja). Wajib grep dulu sebelum menulis helper baru; promosikan ke `pkg/`/`common/` saat feature kedua membutuhkannya.
